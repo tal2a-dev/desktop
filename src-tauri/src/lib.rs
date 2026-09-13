@@ -707,6 +707,77 @@ async fn fetch_subscription(base_url: String) -> Result<SubscriptionInfo, String
     })
 }
 
+/// Hand a URL to the system browser.
+fn open_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let (program, prefix): (&str, &[&str]) = ("open", &[]);
+    #[cfg(target_os = "windows")]
+    let (program, prefix): (&str, &[&str]) = ("cmd", &["/c", "start", ""]);
+    #[cfg(target_os = "linux")]
+    let (program, prefix): (&str, &[&str]) = ("xdg-open", &[]);
+
+    std::process::Command::new(program)
+        .args(prefix)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open a browser: {e}"))
+}
+
+/// Pull a session token out of a sign-in response. new-api forks vary the field
+/// name, so try the ones seen in the wild.
+fn extract_token(body: &serde_json::Value) -> Option<String> {
+    body["data"]["token"]
+        .as_str()
+        .or_else(|| body["token"].as_str())
+        .or_else(|| body["data"]["access_token"].as_str())
+        .or_else(|| body["data"]["key"].as_str())
+        .or_else(|| body["key"].as_str())
+        .or_else(|| body["data"]["session_token"].as_str())
+        .or_else(|| body["data"]["accessToken"].as_str())
+        .or_else(|| body["accessToken"].as_str())
+        .map(str::to_string)
+}
+
+/// Shared tail for every sign-in path — password, 2FA, and GitHub OAuth all end
+/// here. Returns "" on success, or "2FA_REQUIRED:<flow>" when the server wants a
+/// second factor. The token goes to the keyring and never crosses IPC.
+fn finish_login(body: &serde_json::Value) -> Result<String, String> {
+    if body["success"].as_bool() != Some(true) {
+        return Err(body["message"]
+            .as_str()
+            .unwrap_or("Sign-in failed")
+            .to_string());
+    }
+
+    if body["data"]["require_verification"].as_bool() == Some(true) {
+        let flow = body["data"]["flow_token"]
+            .as_str()
+            .ok_or("Second factor required but the server sent no flow token")?;
+        return Ok(format!("2FA_REQUIRED:{flow}"));
+    }
+
+    match extract_token(body) {
+        Some(token) => {
+            store_credential(token)?;
+            Ok(String::new())
+        }
+        None => {
+            let top: Vec<&String> = body
+                .as_object()
+                .map(|o| o.keys().collect())
+                .unwrap_or_default();
+            let data: Vec<&String> = body["data"]
+                .as_object()
+                .map(|o| o.keys().collect())
+                .unwrap_or_default();
+            Err(format!(
+                "Signed in but the response carried no token. Top-level keys: {top:?}, data keys: {data:?}"
+            ))
+        }
+    }
+}
+
 #[tauri::command]
 async fn login(
     username: String,
@@ -717,68 +788,17 @@ async fn login(
     if username.trim().is_empty() || password.is_empty() {
         return Err("Username and password are required".into());
     }
-    let url = format!("{}/api/user/login", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
+    let body: serde_json::Value = client
+        .post(format!("{}/api/user/login", base_url.trim_end_matches('/')))
         .json(&serde_json::json!({ "username": username, "password": password }))
         .send()
         .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
         .map_err(|e| e.to_string())?;
-
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    if body["success"].as_bool() == Some(true) {
-        // Check if 2FA is required
-        if body["data"]["require_verification"].as_bool() == Some(true) {
-            let flow_token = body["data"]["flow_token"]
-                .as_str()
-                .ok_or("2FA required but no flow_token in response")?;
-            // Return special marker so frontend knows to show 2FA input
-            return Ok(format!("2FA_REQUIRED:{}", flow_token));
-        }
-
-        // ponytail: broad fallback chain — new-api forks vary token field names
-        let token = body["data"]["token"]
-            .as_str()
-            .or_else(|| body["token"].as_str())
-            .or_else(|| body["data"]["access_token"].as_str())
-            .or_else(|| body["data"]["key"].as_str())
-            .or_else(|| body["key"].as_str())
-            .or_else(|| body["data"]["session_token"].as_str())
-            .or_else(|| body["data"]["accessToken"].as_str())
-            .or_else(|| body["accessToken"].as_str());
-
-        let token = match token {
-            Some(t) => t.to_string(),
-            None => {
-                let keys: Vec<String> = if let Some(obj) = body.as_object() {
-                    obj.keys().cloned().collect()
-                } else {
-                    vec!["(not an object)".into()]
-                };
-                let data_keys: Vec<String> = if let Some(obj) = body["data"].as_object() {
-                    obj.keys().cloned().collect()
-                } else {
-                    vec!["(no data object)".into()]
-                };
-                return Err(format!(
-                    "Login succeeded but no token found. Top-level keys: {:?}, data keys: {:?}",
-                    keys, data_keys
-                ));
-            }
-        };
-
-        store_credential(token.clone())?;
-        // ponytail: token never crosses the IPC boundary — only "" (success) or
-        // "2FA_REQUIRED:<flow>" crosses (flow token is not a credential).
-        Ok(String::new())
-    } else {
-        Err(body["message"]
-            .as_str()
-            .unwrap_or("Login failed")
-            .to_string())
-    }
+    finish_login(&body)
 }
 
 #[tauri::command]
@@ -791,60 +811,51 @@ async fn verify_2fa(
     if flow_token.trim().is_empty() || code.trim().is_empty() {
         return Err("Flow token and verification code are required".into());
     }
-    let url = format!("{}/api/user/login/verify", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
+    let body: serde_json::Value = client
+        .post(format!(
+            "{}/api/user/login/verify",
+            base_url.trim_end_matches('/')
+        ))
         .json(&serde_json::json!({ "flow_token": flow_token, "code": code }))
         .send()
         .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
         .map_err(|e| e.to_string())?;
-
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    if body["success"].as_bool() == Some(true) {
-        let token = body["data"]["token"]
-            .as_str()
-            .or_else(|| body["token"].as_str())
-            .or_else(|| body["data"]["access_token"].as_str())
-            .or_else(|| body["data"]["key"].as_str())
-            .or_else(|| body["key"].as_str())
-            .ok_or("2FA verified but no token found in response")?
-            .to_string();
-
-        store_credential(token.clone())?;
-        Ok(())
-    } else {
-        Err(body["message"]
-            .as_str()
-            .unwrap_or("2FA verification failed")
-            .to_string())
-    }
+    finish_login(&body).map(|_| ())
 }
 
 #[tauri::command]
-async fn github_oauth(base_url: String) -> Result<(), String> {
+async fn github_oauth(base_url: String) -> Result<String, String> {
     validate_base_url(&base_url)?;
+    let base = base_url.trim_end_matches('/');
+    let client = reqwest::Client::new();
 
-    // ponytail: local HTTP callback server captures OAuth code from browser redirect.
-    // Requires http://localhost:9876/callback added to GitHub OAuth app redirect URIs.
+    // The server owns the OAuth state: it stores a flow in its DB with a
+    // 10-minute TTL and validates that same value when we call back. Inventing
+    // our own state locally was the original bug — nothing could ever match it.
+    let state_body: serde_json::Value = client
+        .post(format!("{}/api/oauth/state", base))
+        .json(&serde_json::json!({ "provider": "github", "intent": "login" }))
+        .send()
+        .await
+        .map_err(|e| format!("Could not start GitHub sign-in: {e}"))?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let state = state_body["data"]["flow_token"]
+        .as_str()
+        .ok_or("Server did not return an OAuth state")?
+        .to_string();
+
+    // Loopback listener. The redirect URI must match the GitHub app byte for
+    // byte, so bind a fixed port instead of echoing back local_addr.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:9876")
         .await
-        .map_err(|e| format!("Failed to start OAuth callback server: {}", e))?;
-    // ponytail: must match the exact string registered in GitHub OAuth app settings
-    let redirect_uri = "http://localhost:9876/callback".to_string();
-
-    // Generate CSRF state
-    let state: String = (0..32)
-        .map(|_| {
-            let idx = rand::random::<usize>() % 62;
-            match idx {
-                0..=9 => (b'0' + idx as u8) as char,
-                10..=35 => (b'a' + (idx - 10) as u8) as char,
-                _ => (b'A' + (idx - 36) as u8) as char,
-            }
-        })
-        .collect();
+        .map_err(|e| format!("Could not start the OAuth callback server: {e}"))?;
+    let redirect_uri = "http://localhost:9876/callback";
 
     // Fetch github_client_id from /api/status
     let status_url = format!("{}/api/status", base_url.trim_end_matches('/'));
@@ -858,114 +869,96 @@ async fn github_oauth(base_url: String) -> Result<(), String> {
 
     let auth_url = format!(
         "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=read:user",
-        client_id,
-        urlencoding::encode(&redirect_uri),
-        state
+        urlencoding::encode(client_id),
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(&state),
     );
 
-    // Open system browser
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open").arg(&auth_url).spawn().map_err(|e| e.to_string())?;
-    #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd").args(["/c", "start", &auth_url]).spawn().map_err(|e| e.to_string())?;
-    #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open").arg(&auth_url).spawn().map_err(|e| e.to_string())?;
+    open_browser(&auth_url)?;
 
-    // Wait for callback with timeout
-    let (stream, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+    // Wait for the browser to be bounced back.
+    let (mut stream, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
         listener.accept(),
     )
     .await
-    .map_err(|_| "OAuth callback timed out after 2 minutes")?
-    .map_err(|e| format!("Failed to accept OAuth callback: {}", e))?;
+    .map_err(|_| "GitHub sign-in timed out")?
+    .map_err(|e| format!("Failed to accept the OAuth callback: {e}"))?;
 
-    // Read HTTP request
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 8192];
     let n = stream.peek(&mut buf).await.map_err(|e| e.to_string())?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Parse code and state from query string
-    let code = request
+    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let query = request
         .lines()
         .next()
-        .and_then(|line| line.split("GET ").nth(1))
-        .and_then(|path| path.split(" ").next())
-        .and_then(|qs| {
-            qs.split('?').nth(1).map(|params| {
-                params
-                    .split('&')
-                    .find_map(|p| p.strip_prefix("code="))
-                    .unwrap_or("")
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|path| path.split_once('?'))
+        .map(|(_, q)| q.to_string())
+        .unwrap_or_default();
+    // GitHub percent-encodes both parameters, so decode before comparing.
+    let param = |key: &str| -> Option<String> {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .map(|v| {
+                urlencoding::decode(v)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| v.to_string())
             })
-        })
-        .unwrap_or("");
+    };
+    let code = param("code");
+    let returned_state = param("state");
+    let matched = code.is_some() && returned_state.as_deref() == Some(state.as_str());
 
-    let returned_state = request
-        .lines()
-        .next()
-        .and_then(|line| line.split("GET ").nth(1))
-        .and_then(|path| path.split(" ").next())
-        .and_then(|qs| {
-            qs.split('?').nth(1).map(|params| {
-                params
-                    .split('&')
-                    .find_map(|p| p.strip_prefix("state="))
-                    .unwrap_or("")
-            })
-        })
-        .unwrap_or("");
-
-    if returned_state != state {
-        return Err("OAuth state mismatch — possible CSRF attack".into());
-    }
-    if code.is_empty() {
-        return Err("No authorization code received from GitHub".into());
-    }
-
-    // ponytail: send HTTP 200 to browser so it doesn't show a connection error
+    // Answer the browser either way, so a rejected sign-in never looks like a
+    // dead connection. Doing this before any early return is the whole point.
     use tokio::io::AsyncWriteExt;
-    let mut stream = stream;
+    let (head, msg) = if matched {
+        (
+            "200 OK",
+            "Signed in. You can close this tab and return to NAPI Desktop.",
+        )
+    } else {
+        (
+            "400 Bad Request",
+            "Sign-in failed. Return to NAPI Desktop and try again.",
+        )
+    };
+    let page = format!(
+        "<!doctype html><meta charset=utf-8><title>NAPI Desktop</title>\
+         <body style=\"font-family:system-ui;padding:3rem\"><h1>{msg}</h1>"
+    );
     let _ = stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h1>Login successful!</h1><p>You can close this tab and return to NAPI Desktop.</p></body></html>")
+        .write_all(
+            format!(
+                "HTTP/1.1 {head}\r\nContent-Type: text/html; charset=utf-8\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                page.len()
+            )
+            .as_bytes(),
+        )
         .await;
     let _ = stream.flush().await;
     drop(stream);
 
-    // Secret comes from the repo-root .env via build.rs — never in source, never in git.
-    let github_client_secret = option_env!("GITHUB_CLIENT_SECRET")
-        .filter(|s| !s.is_empty())
-        .ok_or("GITHUB_CLIENT_SECRET is not set. Copy .env.example to .env, fill it in, rebuild.")?;
-
-    let token_resp = client
-        .post("https://github.com/login/oauth/access_token")
-        .header("Accept", "application/json")
-        .json(&serde_json::json!({
-            "client_id": client_id,
-            "client_secret": github_client_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to exchange code with GitHub: {}", e))?;
-
-    let token_body: serde_json::Value = token_resp.json().await.map_err(|e| e.to_string())?;
-    if token_body["access_token"].as_str().is_none() {
-        return Err(format!(
-            "GitHub token exchange failed: {}",
-            token_body["error_description"]
-                .as_str()
-                .unwrap_or("no access_token in response")
-        ));
+    let code = code.ok_or("GitHub did not return an authorization code")?;
+    if returned_state.as_deref() != Some(state.as_str()) {
+        return Err("OAuth state mismatch — sign-in rejected".into());
     }
 
-    // ponytail: the exchange works, but NAPI has no endpoint that turns a GitHub
-    // access token into a session token — /api/oauth/github demands server-side
-    // state we cannot supply. Server needs POST /api/oauth/github/desktop.
-    Err("GitHub authorized, but this server has no endpoint to finish desktop sign-in. \
-         Server needs: POST /api/oauth/github/desktop { code, redirect_uri }."
-        .to_string())
+    // Hand the code back to the server. It holds the client secret, so the
+    // exchange happens there — and it applies the same login policy as a
+    // password sign-in, so a 2FA-protected account lands in the same challenge.
+    let body: serde_json::Value = client
+        .get(format!("{}/api/oauth/github", base))
+        .query(&[("code", code.as_str()), ("state", state.as_str())])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    finish_login(&body)
 }
 
 

@@ -43,7 +43,6 @@ git clone https://github.com/api-tal2a/desktop.git
 cd desktop
 
 bun install
-cp .env.example .env      # then fill in GITHUB_CLIENT_SECRET — see below
 
 bun run tauri dev
 ```
@@ -58,23 +57,17 @@ bun run tauri build
 
 ## Configuration
 
-`.env` is **gitignored**. `.env.example` is the committed template.
+There is none, and nothing is baked into the binary:
 
-| Variable               | Required                | Purpose                                                   |
-| ---------------------- | ----------------------- | --------------------------------------------------------- |
-| `GITHUB_CLIENT_SECRET` | Only for GitHub sign-in | OAuth client secret for the "Continue with GitHub" button |
+| Value                      | Where it comes from                                                 |
+| -------------------------- | ------------------------------------------------------------------- |
+| Gateway base URL           | Defaults to `https://napi.mikawi.org`, editable in the app          |
+| GitHub OAuth client ID     | Read at runtime from the gateway's `/api/status`                    |
+| GitHub OAuth client secret | Never reaches this app — the gateway holds it and runs the exchange |
 
-`build.rs` reads `.env` from the repo root and injects values as compile-time environment
-variables. Nothing is read at runtime, and **no secret is ever written into source**. If the
-variable is missing the app still builds — the GitHub button reports a clear error and
-username/password sign-in keeps working.
-
-The client ID and gateway URL are fetched at runtime from `/api/status`, so they are not
-duplicated in `.env`.
-
-> **Desktop OAuth note.** A desktop binary is decompilable, so an embedded OAuth client
-> secret is extractable by anyone who has the app. That is expected for installed-app OAuth
-> flows. If that trade-off is unacceptable, the exchange must move server-side.
+No `.env` file, no build-time secrets. A desktop binary is decompilable, so anything embedded
+would be extractable by whoever has the app; keeping the client secret server-side avoids that
+entirely.
 
 ---
 
@@ -99,24 +92,27 @@ Kilo Code · Hermes Agent · Qwen Code · Windsurf
 
 ## Sign-in
 
-Two methods:
+Two methods, both ending in the same place:
 
-1. **Username + password** — supports the gateway's two-factor flow. When the server returns
-   a `flow_token` with `require_verification: true`, the app prompts for a 2FA code and
-   completes the exchange.
-2. **GitHub OAuth** — opens the system browser, catches the redirect on a local loopback
-   server (`http://localhost:9876/callback`), and exchanges the authorization code for a
-   token.
+1. **Username + password** — supports the gateway's two-factor flow. When the server returns a
+   `flow_token` with `require_verification: true`, the app prompts for a 2FA code and completes
+   the exchange.
+2. **GitHub OAuth** — opens the system browser and listens for the redirect on a loopback
+   server at `http://localhost:9876/callback`.
 
-Both paths store the resulting token in the OS keyring.
+Both paths store the resulting session token in the OS keyring.
 
-> **GitHub sign-in is incomplete.** The client-secret exchange against GitHub succeeds — a
-> valid GitHub access token is returned — but the gateway has no endpoint that converts a
-> GitHub access token into a NAPI session token. `/api/oauth/github` requires a server-side
-> `state` value that only the web flow can produce. Completing this needs a new endpoint:
-> `POST /api/oauth/github/desktop { code, redirect_uri }`.
->
-> Username/password sign-in is fully functional.
+The OAuth flow is entirely server-driven, which is what makes it workable from a desktop app:
+
+1. The app asks the gateway to mint a state — `POST /api/oauth/state` with
+   `{ provider: "github", intent: "login" }`. The gateway stores it with a 10-minute TTL. The
+   app cannot invent this value; assuming it could was the original bug.
+2. The app opens GitHub's authorize URL carrying that state and the loopback redirect URI.
+3. GitHub bounces the browser back to `localhost:9876`, and the app answers with a plain
+   "signed in" page — on failure too, so a rejection never looks like a dead connection.
+4. The app hands `code` + `state` to `GET /api/oauth/github`. **The gateway holds the client
+   secret and performs the GitHub exchange itself**, then applies the same login policy it
+   uses for a password sign-in — so a 2FA-protected account lands in the same code prompt.
 
 ---
 
@@ -131,10 +127,9 @@ desktop/
 │       └── pages/             # Login, Agents, Subscription, MCP, Skills
 ├── src-tauri/
 │   ├── src/lib.rs             # 19 Tauri commands — the entire backend
-│   ├── build.rs               # Loads .env into compile-time env vars
+│   ├── build.rs
 │   └── tauri.conf.json
-├── vite.config.ts             # root: "frontend", outDir: "../dist"
-└── .env.example
+└── vite.config.ts             # root: "frontend", outDir: "../dist"
 ```
 
 All privileged work happens in Rust and is exposed to the UI as Tauri commands:
@@ -155,7 +150,8 @@ it from the keyring themselves.
 
 ## Security
 
-- Secrets are read from `.env` at **build time** only — never committed, never in source
+- **No secret is embedded in the binary.** The OAuth client secret stays on the gateway; the
+  app only handles a client ID, which is public
 - Session tokens and API keys live in the **OS keychain**, not files
 - Tokens never cross the IPC boundary to the UI
 - Agent config writes are **atomic** (`.napi-tmp` + rename); a failure leaves the original intact
@@ -170,7 +166,6 @@ it from the keyring themselves.
 
 - **MCP and Skills pages are read-only inspectors**, not sync clients. They report what is
   configured locally. The gateway exposes no MCP or skill registry endpoints.
-- **GitHub sign-in does not complete** — see the note above. Blocked on a server endpoint.
 - **11 of 15 agents are guided, not automatic**, because they keep credentials somewhere the
   app cannot safely write.
 - **Codex API keys are not written by the app.** Codex reads its key from the

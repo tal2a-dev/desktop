@@ -84,23 +84,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .catch(() => dispatch({ type: "RESTORED", authed: false }));
   }, []);
 
+  // ponytail: password and GitHub sign-in share a response contract — "" on
+  // success, "2FA_REQUIRED:<flow>" when the server wants a second factor. The
+  // server applies the same login policy to both, so one handler covers both.
+  const applyLoginResult = (result: string) => {
+    if (result.startsWith("2FA_REQUIRED:")) {
+      dispatch({
+        type: "LOGIN_2FA_REQUIRED",
+        flowToken: result.slice("2FA_REQUIRED:".length),
+      });
+    } else {
+      dispatch({ type: "LOGIN_SUCCESS" });
+    }
+  };
+
   const login = async (username: string, password: string) => {
     dispatch({ type: "LOGIN_START" });
     try {
-      // ponytail: login returns "" on success or "2FA_REQUIRED:<flow>" — never the token.
-      const result = await invoke<string>("login", {
-        username,
-        password,
-        baseUrl: state.baseUrl,
-      });
-      if (result.startsWith("2FA_REQUIRED:")) {
-        dispatch({
-          type: "LOGIN_2FA_REQUIRED",
-          flowToken: result.slice("2FA_REQUIRED:".length),
-        });
-      } else {
-        dispatch({ type: "LOGIN_SUCCESS" });
-      }
+      applyLoginResult(
+        await invoke<string>("login", {
+          username,
+          password,
+          baseUrl: state.baseUrl,
+        }),
+      );
     } catch (e) {
       dispatch({ type: "LOGIN_FAILURE", error: String(e) });
     }
@@ -121,13 +128,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  // ponytail: github_oauth blocks until the local callback server receives the token
-  // (stored in the keyring server-side) or times out.
+  // ponytail: github_oauth blocks on a loopback callback, then returns the same
+  // contract as login — the server runs the same login policy for both.
   const githubOAuth = async () => {
     dispatch({ type: "LOGIN_START" });
     try {
-      await invoke("github_oauth", { baseUrl: state.baseUrl });
-      dispatch({ type: "LOGIN_SUCCESS" });
+      applyLoginResult(
+        await invoke<string>("github_oauth", { baseUrl: state.baseUrl }),
+      );
     } catch (e) {
       dispatch({ type: "LOGIN_FAILURE", error: String(e) });
     }
