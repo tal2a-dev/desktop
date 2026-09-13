@@ -1,5 +1,37 @@
+# ─── Dependencies ────────────────────────────────────────────────
 node_modules/
+
+# ─── Build output ────────────────────────────────────────────────
 dist/
 src-tauri/target/
+*.tsbuildinfo
+
+# ─── Secrets — never commit. Template lives in .env.example ──────
+.env
+.env.local
+.env.*.local
+
+# ─── Logs ────────────────────────────────────────────────────────
 *.log
+
+# ─── OS cruft ────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+
+# ─── Editors ─────────────────────────────────────────────────────
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# ─── Agent tooling — machine-local, regenerated per machine ──────
+.claude/
+.pi/
+.gitnexus/
+graphify-out/
+
+# ─── Stray npm lockfile — this project uses bun ──────────────────
+package-lock.json
+
+# ─── Scratch / atomic-write temp files ───────────────────────────
+*.tmp
+*.napi-tmp
