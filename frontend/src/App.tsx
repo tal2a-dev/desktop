@@ -51,7 +51,7 @@ function Dashboard() {
 }
 
 function AppContent() {
-  const { state } = useAuth();
+  const { state, logout } = useAuth();
   const [setupMsg, setSetupMsg] = useState<string | null>(null);
   const [setupDone, setSetupDone] = useState(false);
 
@@ -62,8 +62,18 @@ function AppContent() {
     // rewrite every detected agent config. The user touches nothing.
     invoke<string[]>("auto_setup", { baseUrl: state.baseUrl })
       .then((msgs) => setSetupMsg(msgs.join(" · ")))
-      .catch((e) => setSetupMsg(String(e)));
-  }, [state.authed, state.baseUrl, setupDone]);
+      .catch((e) => {
+        const msg = String(e);
+        // `authed` is only a cached boolean. If the keyring holds no credential
+        // the session is gone — drop to sign-in rather than showing a storage
+        // error over an empty dashboard.
+        if (/not signed in/i.test(msg)) {
+          logout();
+          return;
+        }
+        setSetupMsg(msg);
+      });
+  }, [state.authed, state.baseUrl, setupDone, logout]);
 
   if (state.loading) {
     return (
