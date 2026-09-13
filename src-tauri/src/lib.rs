@@ -529,6 +529,142 @@ fn scan_skills() -> Vec<SkillInfo> {
     out
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryServer {
+    /// Registry id, e.g. "ac.inference.sh/mcp".
+    pub name: String,
+    pub title: String,
+    pub description: String,
+    pub version: String,
+    /// First remote endpoint.
+    pub url: String,
+    /// "streamable-http" | "sse" | ...
+    pub transport: String,
+    /// Already present in one of this machine's agent configs.
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryPage {
+    pub servers: Vec<RegistryServer>,
+    pub next_cursor: Option<String>,
+}
+
+/// The public MCP registry — no auth, no key.
+const MCP_REGISTRY: &str = "https://registry.modelcontextprotocol.io/v0/servers";
+
+/// Key we file a registry server under in an agent's mcpServers map.
+fn mcp_key(registry_name: &str) -> String {
+    registry_name
+        .rsplit('/')
+        .next()
+        .unwrap_or(registry_name)
+        .to_string()
+}
+
+/// Merge one server into an mcpServers document. Pure so it can be tested.
+fn merge_mcp_server(
+    root: &mut serde_json::Value,
+    key: &str,
+    url: &str,
+    transport: &str,
+) -> Result<(), String> {
+    let obj = root
+        .as_object_mut()
+        .ok_or("config root is not a JSON object")?;
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    let map = servers
+        .as_object_mut()
+        .ok_or("mcpServers is not a JSON object")?;
+    map.insert(
+        key.to_string(),
+        serde_json::json!({
+            "type": if transport.is_empty() { "http" } else { transport },
+            "url": url,
+        }),
+    );
+    Ok(())
+}
+
+/// One page of the public registry, flagged against what is already installed locally.
+#[tauri::command]
+async fn fetch_registry_servers(
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<RegistryPage, String> {
+    let limit = limit.unwrap_or(30).clamp(1, 100);
+    let mut url = format!("{}?limit={}", MCP_REGISTRY, limit);
+    if let Some(c) = cursor.filter(|c| !c.is_empty()) {
+        url.push_str(&format!("&cursor={}", urlencoding::encode(&c)));
+    }
+
+    let client = reqwest::Client::new();
+    let resp = http_get_with_retry(&client, &url).await?;
+    if !resp.status().is_success() {
+        return Err(format!("Registry returned HTTP {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let local: Vec<String> = scan_mcp_servers().into_iter().map(|s| s.name).collect();
+
+    let servers = body["servers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let s = entry.get("server")?;
+            let name = s["name"].as_str()?.to_string();
+            let remote = s["remotes"].as_array().and_then(|r| r.first());
+            let url = remote
+                .and_then(|r| r["url"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let transport = remote
+                .and_then(|r| r["type"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let key = mcp_key(&name);
+            let installed = local.iter().any(|l| l == &name || l == &key);
+            Some(RegistryServer {
+                title: s["title"].as_str().unwrap_or("").to_string(),
+                description: s["description"].as_str().unwrap_or("").to_string(),
+                version: s["version"].as_str().unwrap_or("").to_string(),
+                name,
+                url,
+                transport,
+                installed,
+            })
+        })
+        .collect();
+
+    Ok(RegistryPage {
+        servers,
+        next_cursor: body["metadata"]["nextCursor"].as_str().map(String::from),
+    })
+}
+
+/// Install a registry server into an agent's MCP config (atomic write).
+#[tauri::command]
+fn install_mcp_server(name: String, url: String, transport: String) -> Result<String, String> {
+    validate_base_url(&url)?;
+    let path = home_dir().join(".claude.json");
+
+    let mut root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let key = mcp_key(&name);
+    merge_mcp_server(&mut root, &key, &url, &transport)?;
+
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    atomic_write(&path, out.as_bytes())?;
+    Ok(format!("Installed {} into Claude Code", key))
+}
+
 #[tauri::command]
 fn reconfigure_agent(
     agent_name: String,
@@ -908,25 +1044,59 @@ async fn github_oauth(base_url: String) -> Result<String, String> {
     };
     let code = param("code");
     let returned_state = param("state");
-    let matched = code.is_some() && returned_state.as_deref() == Some(state.as_str());
 
-    // Answer the browser either way, so a rejected sign-in never looks like a
-    // dead connection. Doing this before any early return is the whole point.
+    // Exchange BEFORE answering the browser. Rendering the page first meant it
+    // claimed "Signed in" before the gateway had actually agreed, and hid the
+    // real error from whoever needed to read it.
+    let outcome: Result<String, String> = match code {
+        None => Err("GitHub did not return an authorization code".into()),
+        Some(_) if returned_state.as_deref() != Some(state.as_str()) => {
+            Err("OAuth state mismatch — sign-in rejected".into())
+        }
+        Some(code) => {
+            let sent = client
+                .get(format!("{}/api/oauth/github", base))
+                .query(&[("code", code.as_str()), ("state", state.as_str())])
+                .send()
+                .await;
+            match sent {
+                Err(e) => Err(format!("Could not reach the gateway: {e}")),
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(body) => finish_login(&body),
+                    Err(e) => Err(format!("Gateway sent a non-JSON response: {e}")),
+                },
+            }
+        }
+    };
+
+    // ponytail: the message can carry a server-controlled string, so escape it
+    // before it lands in HTML.
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
     use tokio::io::AsyncWriteExt;
-    let (head, msg) = if matched {
-        (
+    let (head, title, detail) = match &outcome {
+        Ok(marker) if marker.is_empty() => (
             "200 OK",
-            "Signed in. You can close this tab and return to NAPI Desktop.",
-        )
-    } else {
-        (
-            "400 Bad Request",
-            "Sign-in failed. Return to NAPI Desktop and try again.",
-        )
+            "Signed in",
+            "You can close this tab and return to NAPI Desktop.",
+        ),
+        Ok(_) => (
+            "200 OK",
+            "One more step",
+            "Return to NAPI Desktop and enter your two-factor code.",
+        ),
+        Err(e) => ("400 Bad Request", "Sign-in failed", e.as_str()),
     };
     let page = format!(
         "<!doctype html><meta charset=utf-8><title>NAPI Desktop</title>\
-         <body style=\"font-family:system-ui;padding:3rem\"><h1>{msg}</h1>"
+         <body style=\"font-family:system-ui;padding:3rem;max-width:44rem\">\
+         <h1>{}</h1><p style=\"color:#444\">{}</p>",
+        esc(title),
+        esc(detail)
     );
     let _ = stream
         .write_all(
@@ -941,24 +1111,9 @@ async fn github_oauth(base_url: String) -> Result<String, String> {
     let _ = stream.flush().await;
     drop(stream);
 
-    let code = code.ok_or("GitHub did not return an authorization code")?;
-    if returned_state.as_deref() != Some(state.as_str()) {
-        return Err("OAuth state mismatch — sign-in rejected".into());
-    }
-
-    // Hand the code back to the server. It holds the client secret, so the
-    // exchange happens there — and it applies the same login policy as a
-    // password sign-in, so a 2FA-protected account lands in the same challenge.
-    let body: serde_json::Value = client
-        .get(format!("{}/api/oauth/github", base))
-        .query(&[("code", code.as_str()), ("state", state.as_str())])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    finish_login(&body)
+    // Ok("") = fully signed in, Ok("2FA_REQUIRED:<flow>") = second factor needed,
+    // Err = the browser page above already showed why.
+    outcome
 }
 
 
@@ -1156,6 +1311,8 @@ pub fn run() {
             configure_agent,
             scan_mcp_servers,
             scan_skills,
+            fetch_registry_servers,
+            install_mcp_server,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1338,5 +1495,41 @@ mod tests {
             assert!(!s.agent.is_empty());
             assert!(!s.name.contains('/'), "skill name should be a dir name");
         }
+    }
+
+    #[test]
+    fn test_mcp_key_takes_registry_tail() {
+        assert_eq!(mcp_key("ac.inference.sh/mcp"), "mcp");
+        assert_eq!(mcp_key("ai.agentgates/mcp"), "mcp");
+        assert_eq!(mcp_key("obsidian"), "obsidian");
+    }
+
+    #[test]
+    fn test_merge_mcp_server_preserves_other_keys() {
+        // An install must not clobber unrelated config or existing servers.
+        let mut root: serde_json::Value = serde_json::from_str(
+            r#"{"mcpServers":{"obsidian":{"type":"http","url":"https://x"}},"other":{"keep":1}}"#,
+        )
+        .unwrap();
+        merge_mcp_server(&mut root, "mcp", "https://api.inference.sh/mcp", "streamable-http")
+            .unwrap();
+        assert_eq!(root["mcpServers"]["mcp"]["url"], "https://api.inference.sh/mcp");
+        assert_eq!(root["mcpServers"]["mcp"]["type"], "streamable-http");
+        // pre-existing server + unrelated top-level key survive
+        assert_eq!(root["mcpServers"]["obsidian"]["url"], "https://x");
+        assert_eq!(root["other"]["keep"], 1);
+    }
+
+    #[test]
+    fn test_merge_mcp_server_defaults_transport() {
+        let mut root = serde_json::json!({});
+        merge_mcp_server(&mut root, "thing", "https://host/mcp", "").unwrap();
+        assert_eq!(root["mcpServers"]["thing"]["type"], "http");
+    }
+
+    #[test]
+    fn test_merge_mcp_server_rejects_non_object() {
+        let mut root = serde_json::json!([1, 2, 3]);
+        assert!(merge_mcp_server(&mut root, "x", "https://h/mcp", "http").is_err());
     }
 }

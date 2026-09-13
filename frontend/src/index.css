@@ -666,4 +666,62 @@ button:disabled {
   font-size: 0.75rem;
 }
 
+/* Installed / Registry sub-tabs */
+.subtabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.subtab {
+  margin-top: 0;
+  width: auto;
+  padding: 6px 14px;
+  font-size: 0.8rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+}
+
+.subtab.active {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+
+.lib-list.wide {
+  max-height: 460px;
+}
+
+.lib-row.reg {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.reg-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.reg-desc {
+  flex-basis: 100%;
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+  line-height: 1.35;
+}
+
+.lib-row.reg .btn-inline {
+  flex-shrink: 0;
+}
+
+.load-more {
+  margin-top: 12px;
+  width: 100%;
+}
+
 /* MCP / Skills disabled-card grids */
