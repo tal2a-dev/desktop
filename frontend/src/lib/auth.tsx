@@ -5,7 +5,7 @@ import {
   useEffect,
   type ReactNode,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri.ts";
 
 interface AuthState {
   authed: boolean;
@@ -25,6 +25,27 @@ type AuthAction =
   | { type: "SET_BASE_URL"; url: string };
 
 const BASE_URL_DEFAULT = "https://napi.mikawi.org";
+
+const BASE_URL_KEY = "napi:base-url";
+
+function readBaseUrl(): string {
+  try {
+    return localStorage.getItem(BASE_URL_KEY) || BASE_URL_DEFAULT;
+  } catch {
+    return BASE_URL_DEFAULT;
+  }
+}
+
+// Tauri IPC errors arrive as objects; String(e) gives "[object Object]".
+function errorText(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
 
 function authReducer(state: AuthState, action: AuthAction): AuthState {
   switch (action.type) {
@@ -72,7 +93,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(authReducer, {
     authed: false,
-    baseUrl: BASE_URL_DEFAULT,
+    baseUrl: readBaseUrl(),
     loading: true,
     error: null,
     flowToken: null,
@@ -109,7 +130,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }),
       );
     } catch (e) {
-      dispatch({ type: "LOGIN_FAILURE", error: String(e) });
+      dispatch({ type: "LOGIN_FAILURE", error: errorText(e) });
     }
   };
 
@@ -117,15 +138,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!state.flowToken) return;
     dispatch({ type: "LOGIN_START" });
     try {
-      await invoke("verify_2fa", {
+      applyLoginResult(
+        await invoke<string>("verify_2fa", {
         flowToken: state.flowToken,
         code,
         baseUrl: state.baseUrl,
-      });
-      dispatch({ type: "LOGIN_SUCCESS" });
+        }),
+      );
     } catch (e) {
-      dispatch({ type: "LOGIN_FAILURE", error: String(e) });
+      dispatch({ type: "LOGIN_FAILURE", error: errorText(e) });
     }
+  };
+  const setBaseUrl = (url: string) => {
+    try {
+      localStorage.setItem(BASE_URL_KEY, url);
+    } catch {
+      // localStorage unavailable — session-only
+    }
+    invoke("save_base_url", { baseUrl: url }).catch(() => {});
+    dispatch({ type: "SET_BASE_URL", url });
   };
 
   // ponytail: github_oauth blocks on a loopback callback, then returns the same
@@ -137,7 +168,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         await invoke<string>("github_oauth", { baseUrl: state.baseUrl }),
       );
     } catch (e) {
-      dispatch({ type: "LOGIN_FAILURE", error: String(e) });
+      dispatch({ type: "LOGIN_FAILURE", error: errorText(e) });
     }
   };
 
@@ -145,8 +176,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     invoke("clear_credential").catch(() => {});
     dispatch({ type: "LOGOUT" });
   };
-
-  const setBaseUrl = (url: string) => dispatch({ type: "SET_BASE_URL", url });
 
   return (
     <AuthContext.Provider

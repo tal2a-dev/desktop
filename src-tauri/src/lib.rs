@@ -29,13 +29,51 @@ pub struct AgentConfig {
 /// the raw config text. Upgrade to a real per-format parse if a user ever runs
 /// two different NAPI bases at once.
 fn has_napi_marker(path: &std::path::Path) -> bool {
+    let Some(host) = napi_host() else {
+        return false;
+    };
     std::fs::read_to_string(path)
-        .map(|s| s.contains("napi.mikawi.org"))
+        .map(|s| s.contains(&host))
         .unwrap_or(false)
 }
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Host of the configured base URL, persisted in a config file so scans
+/// survive restarts. Falls back to the built-in default.
+fn napi_host() -> Option<String> {
+    let raw = std::fs::read_to_string(base_url_path()).unwrap_or_default();
+    let url = if raw.trim().is_empty() {
+        DEFAULT_BASE_URL.to_string()
+    } else {
+        raw.trim().to_string()
+    };
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+}
+
+const DEFAULT_BASE_URL: &str = "https://napi.mikawi.org";
+
+fn base_url_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("napi-desktop")
+        .join("base_url")
+}
+
+pub fn set_base_url(url: &str) -> Result<(), String> {
+    validate_base_url(url)?;
+    let path = base_url_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    atomic_write(&path, url.trim().as_bytes())
 }
 
 fn atomic_write(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
@@ -653,10 +691,14 @@ fn install_mcp_server(name: String, url: String, transport: String) -> Result<St
     validate_base_url(&url)?;
     let path = home_dir().join(".claude.json");
 
-    let mut root: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    // Never clobber: if the file exists but does not parse, refuse rather than
+    // replacing Claude Code's state with {}.
+    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text).map_err(|e| {
+            format!("~/.claude.json is not valid JSON: {e}. Refusing to overwrite it.")
+        })?,
+        _ => serde_json::json!({}),
+    };
 
     let key = mcp_key(&name);
     merge_mcp_server(&mut root, &key, &url, &transport)?;
@@ -714,23 +756,24 @@ fn reconfigure_agent(
             let path = home_dir()
                 .join(".cline")
                 .join("data")
-                .join("settings")
-                .join("providers.json");
+                   .join("globalState.json");
             let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let mut v: serde_json::Value =
                 serde_json::from_str(&content).map_err(|e| e.to_string())?;
-            // Find or create NAPI provider entry
+               // Match the path scan_agents probes. Cline's globalState stores
+               // provider settings under a provider map.
             let providers = v
                 .as_object_mut()
-                .ok_or("providers.json is not an object")?;
-            let napi_key = "napi";
-            if !providers.contains_key(napi_key) {
-                providers.insert(
-                    napi_key.into(),
-                    serde_json::Value::Object(serde_json::Map::new()),
-                );
-            }
-            let provider = providers[napi_key].as_object_mut().unwrap();
+                   .ok_or("globalState.json is not an object")?
+                   .entry("clineProviders")
+                   .or_insert_with(|| serde_json::json!({}));
+               let provider = providers
+                   .as_object_mut()
+                   .ok_or("clineProviders is not an object")?
+                   .entry("napi")
+                   .or_insert_with(|| serde_json::json!({}))
+                   .as_object_mut()
+                   .ok_or("napi provider entry is not an object")?;
             provider.insert("apiKey".into(), serde_json::Value::String(api_key));
             provider.insert("baseUrl".into(), serde_json::Value::String(base_url));
             let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
@@ -776,7 +819,11 @@ fn reconfigure_agent(
 /// so "Quick Setup" needs no typing from the user.
 #[tauri::command]
 fn configure_agent(agent_name: String, base_url: String) -> Result<String, String> {
-    let key = stored_token()?.ok_or(NOT_SIGNED_IN)?;
+    // Prefer the dedicated sk- key; fall back to the session token only if
+    // ensure_api_key has not run yet (login-only flows).
+    let key = stored_api_key()?
+        .or_else(|| stored_token().ok().flatten())
+        .ok_or(NOT_SIGNED_IN)?;
     reconfigure_agent(agent_name, key, base_url)
 }
 
@@ -796,13 +843,6 @@ async fn fetch_subscription(base_url: String) -> Result<SubscriptionInfo, String
     let token = stored_token()?.ok_or(NOT_SIGNED_IN)?;
     let base = base_url.trim_end_matches('/');
     let client = reqwest::Client::new();
-    let resp = http_get_auth_with_retry(&client, &format!("{}/api/user/self", base), &token).await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} (token: {})", resp.status(), mask_token(&token)));
-    }
-
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
 
     // ponytail: new-api reports quota in internal units. /api/status carries
     // `quota_per_unit` (500000 on this deployment); without it the UI would be
@@ -818,18 +858,117 @@ async fn fetch_subscription(base_url: String) -> Result<SubscriptionInfo, String
         Err(_) => 500_000.0,
     };
 
+    // /api/user/self for wallet numbers (used_quota/quota are real wallet
+    // fields; `role` is an int and there is no `reset_at` — plan title and
+    // reset date must come from /api/subscription/self instead).
+    let user_resp = http_get_auth_with_retry(&client, &format!("{}/api/user/self", base), &token).await?;
+    if !user_resp.status().is_success() {
+        return Err(format!("HTTP {} (token: {})", user_resp.status(), mask_token(&token)));
+    }
+    let user: serde_json::Value = user_resp.json().await.map_err(|e| e.to_string())?;
+
+    // /api/subscription/self: { data: { subscriptions: [ { subscription: {...}, pools: [...] } ] } }
+    let sub_resp = http_get_auth_with_retry(&client, &format!("{}/api/subscription/self", base), &token).await;
+    let sub_body: serde_json::Value = match sub_resp {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    };
+
+    // Pick the active subscription with the latest end_time; sum its pools.
+    // NAPI returns ALL active subscriptions — aggregate every one's pools.
+    let active_subs: Vec<&serde_json::Value> = sub_body["data"]["subscriptions"]
+        .as_array()
+        .map(|subs| {
+            subs.iter()
+                .filter(|s| s["subscription"]["status"].as_str() == Some("active"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !active_subs.is_empty() {
+        let mut used_units = 0.0;
+        let mut total_units = 0.0;
+        let mut plan_ids: Vec<i64> = Vec::new();
+        let mut reset_ts: i64 = 0;
+        for s in &active_subs {
+            for p in s["pools"].as_array().into_iter().flatten() {
+                if let Some(u) = p["amount_used"].as_f64() {
+                    used_units += u;
+                }
+                if let Some(t) = p["amount_total"].as_f64() {
+                    total_units += t;
+                }
+            }
+            let sub = &s["subscription"];
+            plan_ids.push(sub["plan_id"].as_i64().unwrap_or(0));
+            // Earliest upcoming reset across subscriptions is what the user
+            // actually waits for.
+            let r = sub["next_reset_time"].as_i64().unwrap_or(0);
+            if r > 0 && (reset_ts == 0 || r < reset_ts) {
+                reset_ts = r;
+            }
+        }
+
+        // Plan title isn't in the summary — fall back to plan_id label; the
+        // frontend renders whatever string we give.
+        let plan = if plan_ids.len() == 1 {
+            format!("Subscription #{}", plan_ids[0])
+        } else {
+            format!("{} subscriptions", plan_ids.len())
+        };
+        let reset_date = if reset_ts > 0 {
+            // Unix seconds → ISO date; no chrono dependency, do it by hand.
+            let days = reset_ts.div_euclid(86400);
+            let (y, m, d) = civil_from_days(days);
+            format!("{:04}-{:02}-{:02}", y, m, d)
+        } else {
+            "unknown".to_string()
+        };
+
+        // Empty pools (plan without quota pools) → wallet fallback.
+        if total_units > 0.0 {
+            return Ok(SubscriptionInfo {
+                plan,
+                used: quota_to_usd(used_units, per_unit),
+                limit: quota_to_usd(total_units, per_unit),
+                reset_date,
+            });
+        }
+    }
+
+    // Wallet fallback: no active subscription (or pools empty).
     Ok(SubscriptionInfo {
-        plan: body["data"]["role"]
-            .as_str()
-            .unwrap_or("user")
-            .to_string(),
-        used: quota_to_usd(body["data"]["used_quota"].as_f64().unwrap_or(0.0), per_unit),
-        limit: quota_to_usd(body["data"]["quota"].as_f64().unwrap_or(0.0), per_unit),
-        reset_date: body["data"]["reset_at"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string(),
+        plan: format!(
+            "Wallet ({})",
+            role_name(user["data"]["role"].as_i64().unwrap_or(0))
+        ),
+        used: quota_to_usd(user["data"]["used_quota"].as_f64().unwrap_or(0.0), per_unit),
+        limit: quota_to_usd(user["data"]["quota"].as_f64().unwrap_or(0.0), per_unit),
+        reset_date: "n/a — pay-as-you-go".to_string(),
     })
+}
+
+/// new-api role ids → label (user 1, admin 10, root 100).
+fn role_name(role: i64) -> &'static str {
+    match role {
+        100 => "root",
+        10 => "admin",
+        _ => "user",
+    }
+}
+
+/// Days since 1970-01-01 → (y, m, d). Howard Hinnant's civil_from_days.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Hand a URL to the system browser.
@@ -931,7 +1070,7 @@ async fn verify_2fa(
     flow_token: String,
     code: String,
     base_url: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     validate_base_url(&base_url)?;
     if flow_token.trim().is_empty() || code.trim().is_empty() {
         return Err("Flow token and verification code are required".into());
@@ -949,7 +1088,7 @@ async fn verify_2fa(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    finish_login(&body).map(|_| ())
+    finish_login(&body)
 }
 
 #[tauri::command]
@@ -1154,19 +1293,42 @@ async fn ensure_api_key(base_url: String) -> Result<(), String> {
     if !resp.status().is_success() {
         return Err(format!("HTTP {} creating token", resp.status()));
     }
-    // new-api returns only success on create — the key stays the login token,
-    // which is a valid API key in this fork.
+
+    // Re-list tokens and grab the key of the one we just created. new-api's
+    // AddToken returns only success, but GetAllTokens includes the key.
+    let resp = client
+        .get(format!("{}/api/token/", base))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} re-reading tokens", resp.status()));
+    }
+    let list: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let key = list["data"]["items"]
+        .as_array()
+        .or_else(|| list["data"].as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|t| t["name"].as_str() == Some("napi-desktop"))
+                .and_then(|t| t["key"].as_str())
+        })
+        .map(|k| k.to_string())
+        .ok_or("Token created but its key was not returned — create it in the web console")?;
+    let entry = keyring::Entry::new("napi-desktop", "api-key").map_err(|e| e.to_string())?;
+    entry.set_password(&key).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 async fn auto_configure_all(base_url: String) -> Result<Vec<String>, String> {
     validate_base_url(&base_url)?;
-    let token = {
-        let entry = keyring::Entry::new("napi-desktop", "user-token")
-            .map_err(|e| e.to_string())?;
-        entry.get_password().map_err(|e| e.to_string())?
-    };
+    // Prefer the dedicated sk- key; fall back to the session token.
+    let token = stored_api_key()?
+        .or_else(|| stored_token().ok().flatten())
+        .ok_or(NOT_SIGNED_IN)?;
 
     let mut results = Vec::new();
     for agent in scan_agents() {
@@ -1201,6 +1363,16 @@ fn stored_token() -> Result<Option<String>, String> {
     }
 }
 
+fn stored_api_key() -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new("napi-desktop", "api-key").map_err(|e| e.to_string())?;
+    match entry.get_password() {
+        Ok(k) if !k.is_empty() => Ok(Some(k)),
+        Ok(_) => Ok(None),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Shown to the user when there is no usable credential.
 const NOT_SIGNED_IN: &str = "Not signed in — sign in again to continue";
 
@@ -1229,13 +1401,15 @@ fn load_credential() -> Result<bool, String> {
 
 #[tauri::command]
 fn clear_credential() -> Result<(), String> {
-    let entry = keyring::Entry::new("napi-desktop", "user-token")
-        .map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()), // nothing stored — already logged out
-        Err(e) => Err(e.to_string()),
+    for service in ["user-token", "api-key"] {
+        let entry = keyring::Entry::new("napi-desktop", service).map_err(|e| e.to_string())?;
+        match entry.delete_credential() {
+            Ok(()) => {}
+            Err(keyring::Error::NoEntry) => {} // nothing stored — already logged out
+            Err(e) => return Err(e.to_string()),
+        }
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1272,12 +1446,26 @@ fn launch_agent(binary_name: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         // ponytail: xdg-open would hand the binary to a GUI app; an interactive CLI
-        // needs a terminal emulator.
-        std::process::Command::new("x-terminal-emulator")
-            .arg("-e")
-            .arg(&binary_name)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        // needs a terminal emulator. x-terminal-emulator only exists on Debian.
+        let name = binary_name.as_str();
+        let candidates: [(&str, &[&str]); 6] = [
+            ("x-terminal-emulator", &["-e", name]),
+            ("gnome-terminal", &["--", name]),
+            ("konsole", &["-e", name]),
+            ("xfce4-terminal", &["-e", name]),
+            ("kitty", &[name]),
+            ("xterm", &["-e", name]),
+        ];
+        let spawned = candidates
+            .iter()
+            .any(|(bin, args)| std::process::Command::new(bin).args(*args).spawn().is_ok());
+        if !spawned {
+            return Err(
+                "No terminal emulator found (tried x-terminal-emulator, gnome-terminal, \
+                 konsole, xfce4-terminal, kitty, xterm)"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
@@ -1306,6 +1494,11 @@ async fn get_status(base_url: String) -> Result<serde_json::Value, String> {
     resp.json().await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn save_base_url(base_url: String) -> Result<(), String> {
+    set_base_url(&base_url)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1331,6 +1524,7 @@ pub fn run() {
             scan_skills,
             fetch_registry_servers,
             install_mcp_server,
+               save_base_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1441,23 +1635,35 @@ mod tests {
     #[test]
     fn test_keyring_store_load_clear_cycle() {
         let _serial = KEYRING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // ponytail: the real OS keychain is not always reachable from a bare
-        // test binary (headless CI returns NoEntry/PlatformFailure). When it is
-        // reachable, the full store→load→clear cycle must hold; when it is not,
-        // the commands must fail cleanly rather than panic.
-        let entry = match keyring::Entry::new("napi-desktop", "user-token") {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        match (store_credential("napi-test-token-value".into()), entry.get_password()) {
+        // ponytail: this test used to `return` when Entry::new() failed, which
+        // silently passed on a build with NO keyring backend feature — exactly
+        // the bug that made login fail after a successful HTTP call. Fail loudly
+        // now; a genuinely headless runner can opt out explicitly.
+        if std::env::var("NAPI_SKIP_KEYRING_TESTS").is_ok() {
+            return;
+        }
+        let entry = keyring::Entry::new("napi-desktop", "user-token").expect(
+            "no keyring backend compiled — add a keystore feature to the keyring dependency",
+        );
+        // The keychain itself may still be locked/absent at runtime: tolerate a
+        // clean error, but never a panic, and always require clear() to succeed.
+        match (
+            store_credential("napi-test-token-value".into()),
+            entry.get_password(),
+        ) {
             (Ok(()), Ok(p)) => {
                 assert_eq!(p, "napi-test-token-value");
                 clear_credential().unwrap();
-                assert!(matches!(entry.get_password().err(), Some(keyring::Error::NoEntry)));
+                assert!(matches!(
+                    entry.get_password().err(),
+                    Some(keyring::Error::NoEntry)
+                ));
             }
             (Ok(()), Err(_)) | (Err(_), _) => {
-                // Keychain unreachable from the test context — clear must still succeed.
-                assert!(clear_credential().is_ok() || entry.get_password().is_err());
+                assert!(
+                    clear_credential().is_ok() || entry.get_password().is_err(),
+                    "clear_credential must not fail hard"
+                );
             }
         }
     }

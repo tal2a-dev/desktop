@@ -25,25 +25,18 @@ export class ErrorBoundary extends Component<Props, State> {
     if (this.state.hasError) {
       return (
         this.props.fallback ?? (
-          <div
-            style={{ padding: 24, color: "#f87171", fontFamily: "system-ui" }}
-          >
-            <h2>Something went wrong</h2>
-            <p>{this.state.error}</p>
-            <button
-              onClick={() => this.setState({ hasError: false, error: null })}
-              style={{
-                marginTop: 12,
-                padding: "8px 16px",
-                background: "#0d9488",
-                color: "#fff",
-                border: "none",
-                borderRadius: 6,
-                cursor: "pointer",
-              }}
-            >
-              Try again
-            </button>
+          <div className="napi">
+            <div className="error-fallback" role="alert">
+              <h2>Something went wrong</h2>
+              <p>{this.state.error}</p>
+              <button
+                className="btn-secondary"
+                style={{ marginTop: 12 }}
+                onClick={() => this.setState({ hasError: false, error: null })}
+              >
+                Try again
+              </button>
+            </div>
           </div>
         )
       );
