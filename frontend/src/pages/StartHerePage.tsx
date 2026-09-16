@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { AgentIcon } from "@/components/AgentIcon.tsx";
+import { ChatgptDesktopDownload } from "@/components/ChatgptDesktopDownload.tsx";
 import { McpIcon } from "@/components/BrandIcons.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { cn } from "@/lib/utils.ts";
@@ -380,6 +381,7 @@ export function StartHerePage() {
             })}
           </div>
         )}
+        <ChatgptDesktopDownload />
       </section>
 
       <section className="pb-8">

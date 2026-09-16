@@ -4,8 +4,11 @@ import { Button } from "@/components/ui/button.tsx";
 import { Input } from "@/components/ui/input.tsx";
 import { cn } from "@/lib/utils.ts";
 import { AgentIcon } from "@/components/AgentIcon.tsx";
+import { ChatgptDesktopDownload } from "@/components/ChatgptDesktopDownload.tsx";
 import { invoke } from "../lib/tauri.ts";
 import { useAuth } from "../lib/auth";
+import { settingsApi } from "@/lib/api.ts";
+import { thisMachineDownloadUrl } from "@/config/chatgptDesktop.ts";
 
 interface AgentConfig {
   id: string;
@@ -404,6 +407,20 @@ export function AgentsPage() {
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
+                    {a.id === "codex" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy === a.id || busy === "__all__"}
+                        onClick={() => {
+                          void settingsApi
+                            .openExternal(thisMachineDownloadUrl())
+                            .catch((e) => toast.error(String(e)));
+                        }}
+                      >
+                        Download app
+                      </Button>
+                    )}
                     {!a.installed && a.installable && (
                       <Button
                         size="sm"
@@ -458,6 +475,8 @@ export function AgentsPage() {
           })}
         </div>
       )}
+
+      <ChatgptDesktopDownload />
 
       {confirmOpen && (
         <div
