@@ -1,3 +1,17 @@
+mod agent_scan;
+mod agent_write;
+mod env_checker;
+mod env_manager;
+mod mcp;
+mod napi_account;
+mod skills;
+mod tool_lifecycle;
+mod tool_versions;
+
+use mcp::{
+    delete_mcp_server, fetch_registry_servers, get_mcp_servers, import_mcp_from_apps,
+    install_mcp_server, scan_mcp_servers, toggle_mcp_app, upsert_mcp_server, validate_mcp_command,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::Manager;
@@ -23,6 +37,9 @@ pub struct AgentConfig {
     /// Brand accent for the UI tile.
     pub color: String,
     pub binary_name: String,
+    /// cc-switch can install this CLI from the app (npm / hermes install.sh).
+    pub installable: bool,
+    pub uninstallable: bool,
 }
 
 /// ponytail: cheap "is this already pointed at us" probe — a substring check on
@@ -37,7 +54,7 @@ fn has_napi_marker(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -76,7 +93,7 @@ pub fn set_base_url(url: &str) -> Result<(), String> {
     atomic_write(&path, url.trim().as_bytes())
 }
 
-fn atomic_write(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("napi-tmp");
     std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -86,7 +103,7 @@ fn atomic_write(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
 }
 
 /// ponytail: 3 retries with exponential backoff covers transient network/429s
-async fn http_get_with_retry(
+pub(crate) async fn http_get_with_retry(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<reqwest::Response, String> {
@@ -110,7 +127,7 @@ async fn http_get_with_retry(
     Err(last_err)
 }
 
-async fn http_get_auth_with_retry(
+pub(crate) async fn http_get_auth_with_retry(
     client: &reqwest::Client,
     url: &str,
     token: &str,
@@ -148,7 +165,7 @@ fn mask_token(token: &str) -> String {
     }
 }
 
-fn validate_base_url(url: &str) -> Result<(), String> {
+pub(crate) fn validate_base_url(url: &str) -> Result<(), String> {
     if url.trim().is_empty() {
         return Err("Base URL cannot be empty".into());
     }
@@ -173,52 +190,16 @@ fn validate_binary_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Is the agent CLI actually runnable?
-///
-/// ponytail: a bundled .app inherits launchd's minimal PATH, so `which` alone
-/// reports false negatives for ~/.local/bin, /opt/homebrew/bin and friends.
-/// Probe the usual install dirs directly as a fallback.
+/// CLI on a real install path — not a Grok/cmux session shim.
 fn binary_exists(binary_name: &str) -> bool {
     if validate_binary_name(binary_name).is_err() {
         return false;
     }
-
-    let probe = if cfg!(target_os = "windows") {
-        "where"
-    } else {
-        "which"
-    };
-    if std::process::Command::new(probe)
-        .arg(binary_name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    let home = home_dir();
-    let exe = if cfg!(target_os = "windows") {
-        format!("{}.exe", binary_name)
-    } else {
-        binary_name.to_string()
-    };
-    let candidates = [
-        home.join(".local/bin"),
-        home.join("bin"),
-        home.join(".bun/bin"),
-        home.join(".cargo/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-    ];
-    candidates.iter().any(|dir| dir.join(&exe).is_file())
+    agent_scan::cli_installed("", binary_name)
 }
 
 /// new-api reports quota in internal units; `quota_per_unit` converts to USD.
-fn quota_to_usd(raw: f64, per_unit: f64) -> f64 {
+pub(crate) fn quota_to_usd(raw: f64, per_unit: f64) -> f64 {
     if per_unit > 0.0 {
         raw / per_unit
     } else {
@@ -229,7 +210,7 @@ fn quota_to_usd(raw: f64, per_unit: f64) -> f64 {
 /// Brand accent used by the UI tile for each tool.
 fn agent_color(id: &str) -> &'static str {
     match id {
-        "claude" => "#D97757",
+        "claude" | "claude-desktop" => "#D97757",
         "codex" => "#10A37F",
         "cline" => "#5B9BD5",
         "opencode" => "#E87040",
@@ -243,6 +224,8 @@ fn agent_color(id: &str) -> &'static str {
         "kilocode" => "#F97316",
         "hermes" => "#8B5CF6",
         "qwen" => "#10B981",
+        "openclaw" => "#F59E0B",
+        "pi" => "#06B6D4",
         "windsurf" => "#09B6A2",
         _ => "#6E7681",
     }
@@ -251,9 +234,6 @@ fn agent_color(id: &str) -> &'static str {
 #[tauri::command]
 fn scan_agents() -> Vec<AgentConfig> {
     let home = home_dir();
-    let appdata = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join("AppData").join("Roaming"));
 
     // (id, name, description, config_path, key_field, base_url_field, format,
     //  binary_name, config_type)
@@ -261,8 +241,8 @@ fn scan_agents() -> Vec<AgentConfig> {
         (
             "claude",
             "Claude Code",
-            "Anthropic's terminal coding agent",
-            home.join(".claude").join("settings.json"),
+            "Claude Code pointed at NAPI",
+            agent_write::config_dir_for("claude").join("settings.json"),
             "env.ANTHROPIC_API_KEY",
             "env.ANTHROPIC_BASE_URL",
             "json",
@@ -270,10 +250,21 @@ fn scan_agents() -> Vec<AgentConfig> {
             "auto",
         ),
         (
+            "claude-desktop",
+            "Claude Desktop",
+            "Claude Desktop Chat, Cowork, and Code tab via 3P gateway",
+            agent_write::claude_desktop_paths_from_home(&home).0,
+            "inferenceGatewayApiKey",
+            "inferenceGatewayBaseUrl",
+            "json",
+            "claude-desktop",
+            "auto",
+        ),
+        (
             "codex",
-            "OpenAI Codex CLI",
-            "OpenAI's coding CLI",
-            home.join(".codex").join("config.toml"),
+            "Codex",
+            "Codex CLI, Desktop, and ChatGPT cowork (shared ~/.codex)",
+            agent_write::config_dir_for("codex").join("config.toml"),
             "env_key",
             "base_url",
             "toml",
@@ -295,11 +286,7 @@ fn scan_agents() -> Vec<AgentConfig> {
             "opencode",
             "OpenCode",
             "Open-source terminal AI assistant",
-            if cfg!(target_os = "windows") {
-                appdata.join("opencode").join("opencode.json")
-            } else {
-                home.join(".config").join("opencode").join("opencode.json")
-            },
+            agent_write::config_dir_for("opencode").join("opencode.json"),
             "provider_env.OPENAI_API_KEY",
             "provider_env.OPENAI_BASE_URL",
             "json",
@@ -309,123 +296,145 @@ fn scan_agents() -> Vec<AgentConfig> {
         (
             "gemini",
             "Gemini CLI",
-            "Google's Gemini command-line agent",
-            home.join(".gemini").join("settings.json"),
-            "",
-            "",
-            "json",
+            "Gemini CLI pointed at NAPI",
+            agent_write::config_dir_for("gemini").join(".env"),
+            "GEMINI_API_KEY",
+            "GEMINI_BASE_URL",
+            "env",
             "gemini",
-            "guide",
+            "auto",
         ),
         (
             "cursor",
             "Cursor",
             "Cursor AI code editor",
             home.join(".cursor").join("cli-config.json"),
-            "",
-            "",
+            "env.OPENAI_API_KEY",
+            "env.OPENAI_BASE_URL",
             "json",
             "agent",
-            "guide",
+            "auto",
         ),
         (
             "continue",
             "Continue",
             "Open-source IDE coding assistant",
             home.join(".continue").join("config.json"),
-            "",
-            "",
+            "models[0].apiKey",
+            "models[0].apiBase",
             "json",
             "continue",
-            "guide",
+            "auto",
         ),
         (
             "goose",
             "Goose",
             "Block's local autonomous agent",
-            home.join(".config").join("goose").join("config.yaml"),
-            "",
-            "",
-            "yaml",
+            home.join(".config").join("goose").join(".env"),
+            "OPENAI_API_KEY",
+            "OPENAI_HOST",
+            "env",
             "goose",
-            "guide",
+            "auto",
         ),
         (
             "factory",
             "Factory Droid",
             "Factory's autonomous coding agent",
             home.join(".factory").join("config.json"),
-            "",
-            "",
+            "env.OPENAI_API_KEY",
+            "env.OPENAI_BASE_URL",
             "json",
             "droid",
-            "guide",
+            "auto",
         ),
         (
             "grok",
             "Grok CLI",
             "xAI's terminal coding agent",
-            home.join(".grok").join("auth.json"),
-            "",
-            "",
-            "json",
+            agent_write::config_dir_for("grok").join("config.toml"),
+            "api_key",
+            "base_url",
+            "toml",
             "grok",
-            "guide",
+            "auto",
         ),
         (
             "roo",
             "Roo Code",
             "VS Code autonomous coding agent",
-            home.join(".roo"),
-            "",
-            "",
+            home.join(".roo").join("napi.json"),
+            "env.OPENAI_API_KEY",
+            "env.OPENAI_BASE_URL",
             "json",
             "roo",
-            "guide",
+            "auto",
         ),
         (
             "kilocode",
             "Kilo Code",
             "VS Code autonomous coding agent",
-            home.join(".kilocode"),
-            "",
-            "",
+            home.join(".kilocode").join("napi.json"),
+            "env.OPENAI_API_KEY",
+            "env.OPENAI_BASE_URL",
             "json",
             "kilocode",
-            "guide",
+            "auto",
         ),
         (
             "hermes",
             "Hermes Agent",
             "Nous Research self-improving agent",
-            home.join(".hermes"),
-            "",
-            "",
-            "json",
+            agent_write::config_dir_for("hermes").join("config.yaml"),
+            "openai_api_key",
+            "openai_base_url",
+            "yaml",
             "hermes",
-            "guide",
+            "auto",
         ),
         (
             "qwen",
             "Qwen Code",
             "Alibaba's coding CLI",
             home.join(".qwen").join("settings.json"),
-            "",
-            "",
+            "env.OPENAI_API_KEY",
+            "env.OPENAI_BASE_URL",
             "json",
             "qwen",
-            "guide",
+            "auto",
+        ),
+        (
+            "openclaw",
+            "OpenClaw",
+            "OpenClaw coding agent",
+            agent_write::config_dir_for("openclaw").join("openclaw.json"),
+            "apiKey",
+            "baseUrl",
+            "json",
+            "openclaw",
+            "auto",
+        ),
+        (
+            "pi",
+            "Pi",
+            "Pi coding agent",
+            agent_write::config_dir_for("pi").join("models.json"),
+            "apiKey",
+            "baseUrl",
+            "json",
+            "pi",
+            "auto",
         ),
         (
             "windsurf",
             "Windsurf",
             "Codeium's IDE agent",
-            home.join(".codeium").join("windsurf"),
-            "",
-            "",
+            home.join(".codeium").join("windsurf").join("napi.json"),
+            "env.OPENAI_API_KEY",
+            "env.OPENAI_BASE_URL",
             "json",
             "windsurf",
-            "guide",
+            "auto",
         ),
     ];
 
@@ -433,12 +442,13 @@ fn scan_agents() -> Vec<AgentConfig> {
         .into_iter()
         .map(
             |(id, name, description, config_path, key_field, base_url_field, format, binary_name, config_type)| {
+                let probe = agent_scan::probe(id, binary_name, &config_path);
                 AgentConfig {
                     id: id.into(),
                     name: name.into(),
                     description: description.into(),
-                    detected: config_path.exists(),
-                    installed: binary_exists(binary_name),
+                    detected: probe.detected(),
+                    installed: probe.installed(),
                     configured: has_napi_marker(&config_path),
                     config_path,
                     key_field: key_field.into(),
@@ -447,6 +457,8 @@ fn scan_agents() -> Vec<AgentConfig> {
                     config_type: config_type.into(),
                     color: agent_color(id).into(),
                     binary_name: binary_name.into(),
+                    installable: tool_lifecycle::can_install(id),
+                    uninstallable: tool_lifecycle::can_uninstall(id),
                 }
             },
         )
@@ -454,82 +466,9 @@ fn scan_agents() -> Vec<AgentConfig> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServer {
-    pub name: String,
-    /// Which agent this server is configured in.
-    pub agent: String,
-    /// "stdio" | "http" | "sse" | ...
-    pub kind: String,
-    /// Command name for stdio, scheme://host/path for http. Credentials are NEVER included.
-    pub target: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInfo {
     pub name: String,
     pub agent: String,
-}
-
-/// ponytail: strip query + fragment so tokens embedded in MCP URLs never reach the UI.
-fn redact_url(url: &str) -> String {
-    let no_fragment = url.split('#').next().unwrap_or(url);
-    no_fragment.split('?').next().unwrap_or(no_fragment).to_string()
-}
-
-/// Every MCP server configured in any agent, with credentials stripped.
-#[tauri::command]
-fn scan_mcp_servers() -> Vec<McpServer> {
-    let home = home_dir();
-    let sources: [(&str, PathBuf, &str); 3] = [
-        ("Claude Code", home.join(".claude.json"), "mcpServers"),
-        ("Cursor", home.join(".cursor").join("mcp.json"), "mcpServers"),
-        (
-            "OpenCode",
-            home.join(".config").join("opencode").join("opencode.json"),
-            "mcp",
-        ),
-    ];
-
-    let mut out = Vec::new();
-    for (agent, path, key) in sources {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let servers = json
-            .get(key)
-            .or_else(|| json.get("mcpServers"))
-            .and_then(|v| v.as_object());
-        let Some(servers) = servers else { continue };
-
-        for (name, cfg) in servers {
-            let kind = cfg
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stdio")
-                .to_string();
-            // ponytail: only the command or the redacted URL — never env/headers/args,
-            // which routinely hold live API keys.
-            let target = if kind == "stdio" {
-                cfg.get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                redact_url(cfg.get("url").and_then(|v| v.as_str()).unwrap_or(""))
-            };
-            out.push(McpServer {
-                name: name.clone(),
-                agent: agent.to_string(),
-                kind,
-                target,
-            });
-        }
-    }
-    out.sort_by(|a, b| a.agent.cmp(&b.agent).then(a.name.cmp(&b.name)));
-    out
 }
 
 /// Every installed skill across agents. A skill is a directory containing SKILL.md.
@@ -568,146 +507,6 @@ fn scan_skills() -> Vec<SkillInfo> {
     out
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegistryServer {
-    /// Registry id, e.g. "ac.inference.sh/mcp".
-    pub name: String,
-    pub title: String,
-    pub description: String,
-    pub version: String,
-    /// First remote endpoint.
-    pub url: String,
-    /// "streamable-http" | "sse" | ...
-    pub transport: String,
-    /// Already present in one of this machine's agent configs.
-    pub installed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegistryPage {
-    pub servers: Vec<RegistryServer>,
-    pub next_cursor: Option<String>,
-}
-
-/// The public MCP registry — no auth, no key.
-const MCP_REGISTRY: &str = "https://registry.modelcontextprotocol.io/v0/servers";
-
-/// Key we file a registry server under in an agent's mcpServers map.
-fn mcp_key(registry_name: &str) -> String {
-    registry_name
-        .rsplit('/')
-        .next()
-        .unwrap_or(registry_name)
-        .to_string()
-}
-
-/// Merge one server into an mcpServers document. Pure so it can be tested.
-fn merge_mcp_server(
-    root: &mut serde_json::Value,
-    key: &str,
-    url: &str,
-    transport: &str,
-) -> Result<(), String> {
-    let obj = root
-        .as_object_mut()
-        .ok_or("config root is not a JSON object")?;
-    let servers = obj
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}));
-    let map = servers
-        .as_object_mut()
-        .ok_or("mcpServers is not a JSON object")?;
-    map.insert(
-        key.to_string(),
-        serde_json::json!({
-            "type": if transport.is_empty() { "http" } else { transport },
-            "url": url,
-        }),
-    );
-    Ok(())
-}
-
-/// One page of the public registry, flagged against what is already installed locally.
-#[tauri::command]
-async fn fetch_registry_servers(
-    cursor: Option<String>,
-    limit: Option<usize>,
-) -> Result<RegistryPage, String> {
-    let limit = limit.unwrap_or(30).clamp(1, 100);
-    let mut url = format!("{}?limit={}", MCP_REGISTRY, limit);
-    if let Some(c) = cursor.filter(|c| !c.is_empty()) {
-        url.push_str(&format!("&cursor={}", urlencoding::encode(&c)));
-    }
-
-    let client = reqwest::Client::new();
-    let resp = http_get_with_retry(&client, &url).await?;
-    if !resp.status().is_success() {
-        return Err(format!("Registry returned HTTP {}", resp.status()));
-    }
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    let local: Vec<String> = scan_mcp_servers().into_iter().map(|s| s.name).collect();
-
-    let servers = body["servers"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| {
-            let s = entry.get("server")?;
-            let name = s["name"].as_str()?.to_string();
-            let remote = s["remotes"].as_array().and_then(|r| r.first());
-            let url = remote
-                .and_then(|r| r["url"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let transport = remote
-                .and_then(|r| r["type"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let key = mcp_key(&name);
-            let installed = local.iter().any(|l| l == &name || l == &key);
-            Some(RegistryServer {
-                title: s["title"].as_str().unwrap_or("").to_string(),
-                description: s["description"].as_str().unwrap_or("").to_string(),
-                version: s["version"].as_str().unwrap_or("").to_string(),
-                name,
-                url,
-                transport,
-                installed,
-            })
-        })
-        .collect();
-
-    Ok(RegistryPage {
-        servers,
-        next_cursor: body["metadata"]["nextCursor"].as_str().map(String::from),
-    })
-}
-
-/// Install a registry server into an agent's MCP config (atomic write).
-#[tauri::command]
-fn install_mcp_server(name: String, url: String, transport: String) -> Result<String, String> {
-    validate_base_url(&url)?;
-    let path = home_dir().join(".claude.json");
-
-    // Never clobber: if the file exists but does not parse, refuse rather than
-    // replacing Claude Code's state with {}.
-    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text).map_err(|e| {
-            format!("~/.claude.json is not valid JSON: {e}. Refusing to overwrite it.")
-        })?,
-        _ => serde_json::json!({}),
-    };
-
-    let key = mcp_key(&name);
-    merge_mcp_server(&mut root, &key, &url, &transport)?;
-
-    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    atomic_write(&path, out.as_bytes())?;
-    Ok(format!("Installed {} into Claude Code", key))
-}
-
 #[tauri::command]
 fn reconfigure_agent(
     agent_name: String,
@@ -718,100 +517,7 @@ fn reconfigure_agent(
     if api_key.trim().is_empty() {
         return Err("API key cannot be empty".into());
     }
-    match agent_name.as_str() {
-        "Claude Code" => {
-            let path = home_dir().join(".claude").join("settings.json");
-            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let mut v: serde_json::Value =
-                serde_json::from_str(&content).map_err(|e| e.to_string())?;
-            let env = v
-                .as_object_mut()
-                .ok_or("settings.json is not an object")?
-                .entry("env")
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-            env["ANTHROPIC_API_KEY"] = serde_json::Value::String(api_key);
-            env["ANTHROPIC_BASE_URL"] = serde_json::Value::String(base_url);
-            let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-            atomic_write(&path, out.as_bytes())?;
-            Ok(format!("Reconfigured {}", agent_name))
-        }
-        "Codex" => {
-            let path = home_dir().join(".codex").join("config.toml");
-            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let mut doc = content
-                .parse::<toml_edit::DocumentMut>()
-                .map_err(|e| e.to_string())?;
-            // Set openai_base_url for built-in provider override
-            doc["openai_base_url"] = toml_edit::value(base_url);
-            let out = doc.to_string();
-            atomic_write(&path, out.as_bytes())?;
-            Ok(format!(
-                "Reconfigured {}: base_url written to config.toml. Codex reads its key from the \
-                 OPENAI_API_KEY environment variable, which this app deliberately does not write \
-                 — run `export OPENAI_API_KEY=<key from Console → Tokens>` in your shell.",
-                agent_name
-            ))
-        }
-        "Cline" => {
-            let path = home_dir()
-                .join(".cline")
-                .join("data")
-                   .join("globalState.json");
-            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let mut v: serde_json::Value =
-                serde_json::from_str(&content).map_err(|e| e.to_string())?;
-               // Match the path scan_agents probes. Cline's globalState stores
-               // provider settings under a provider map.
-            let providers = v
-                .as_object_mut()
-                   .ok_or("globalState.json is not an object")?
-                   .entry("clineProviders")
-                   .or_insert_with(|| serde_json::json!({}));
-               let provider = providers
-                   .as_object_mut()
-                   .ok_or("clineProviders is not an object")?
-                   .entry("napi")
-                   .or_insert_with(|| serde_json::json!({}))
-                   .as_object_mut()
-                   .ok_or("napi provider entry is not an object")?;
-            provider.insert("apiKey".into(), serde_json::Value::String(api_key));
-            provider.insert("baseUrl".into(), serde_json::Value::String(base_url));
-            let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-            atomic_write(&path, out.as_bytes())?;
-            Ok(format!("Reconfigured {}", agent_name))
-        }
-        "OpenCode" => {
-            let path = if cfg!(target_os = "windows") {
-                let appdata = std::env::var("APPDATA")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| home_dir().join("AppData").join("Roaming"));
-                appdata.join("opencode").join("opencode.json")
-            } else {
-                home_dir()
-                    .join(".config")
-                    .join("opencode")
-                    .join("opencode.json")
-            };
-            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let mut v: serde_json::Value =
-                serde_json::from_str(&content).map_err(|e| e.to_string())?;
-            let penv = v
-                .as_object_mut()
-                .ok_or("opencode.json is not an object")?
-                .entry("provider_env")
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-            penv["OPENAI_API_KEY"] = serde_json::Value::String(api_key);
-            penv["OPENAI_BASE_URL"] = serde_json::Value::String(base_url);
-            let out = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-            atomic_write(&path, out.as_bytes())?;
-            Ok(format!("Reconfigured {}", agent_name))
-        }
-        "Gemini CLI" | "Cursor" => Err(format!(
-            "{} cannot be auto-configured. Configure manually via its settings UI.",
-            agent_name
-        )),
-        _ => Err(format!("Agent '{}' not supported", agent_name)),
-    }
+    agent_write::write_agent(&agent_name, &api_key, &base_url)
 }
 
 /// One-click setup: use the stored API key, write the agent config.
@@ -937,13 +643,17 @@ async fn fetch_subscription(base_url: String) -> Result<SubscriptionInfo, String
     }
 
     // Wallet fallback: no active subscription (or pools empty).
+    // NAPI `quota` is remaining balance (DecreaseUserQuota subtracts);
+    // `used_quota` is lifetime consumed. Cap = used + remaining.
+    let used_units = user["data"]["used_quota"].as_f64().unwrap_or(0.0);
+    let remaining_units = user["data"]["quota"].as_f64().unwrap_or(0.0);
     Ok(SubscriptionInfo {
         plan: format!(
             "Wallet ({})",
             role_name(user["data"]["role"].as_i64().unwrap_or(0))
         ),
-        used: quota_to_usd(user["data"]["used_quota"].as_f64().unwrap_or(0.0), per_unit),
-        limit: quota_to_usd(user["data"]["quota"].as_f64().unwrap_or(0.0), per_unit),
+        used: quota_to_usd(used_units, per_unit),
+        limit: quota_to_usd(used_units + remaining_units, per_unit),
         reset_date: "n/a — pay-as-you-go".to_string(),
     })
 }
@@ -1253,73 +963,7 @@ async fn github_oauth(app: tauri::AppHandle, base_url: String) -> Result<String,
 
 #[tauri::command]
 async fn ensure_api_key(base_url: String) -> Result<(), String> {
-    validate_base_url(&base_url)?;
-    let base = base_url.trim_end_matches('/');
-    let token = stored_token()?.ok_or(NOT_SIGNED_IN)?;
-
-    let client = reqwest::Client::new();
-    // List existing tokens; reuse one named "napi-desktop" if present.
-    let resp = client
-        .get(format!("{}/api/token/", base))
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} listing tokens", resp.status()));
-    }
-    let list: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let has_ours = list["data"]["items"]
-        .as_array()
-        .or_else(|| list["data"].as_array())
-        .map(|items| {
-            items
-                .iter()
-                .any(|t| t["name"].as_str() == Some("napi-desktop"))
-        })
-        .unwrap_or(false);
-    if has_ours {
-        return Ok(()); // ponytail: reuse instead of spawning duplicates on every login
-    }
-
-    // Create a fresh token named "napi-desktop".
-    let resp = client
-        .post(format!("{}/api/token/", base))
-        .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({ "name": "napi-desktop", "remain_quota": 500000, "unlimited_quota": true, "expired_time": -1 }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} creating token", resp.status()));
-    }
-
-    // Re-list tokens and grab the key of the one we just created. new-api's
-    // AddToken returns only success, but GetAllTokens includes the key.
-    let resp = client
-        .get(format!("{}/api/token/", base))
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} re-reading tokens", resp.status()));
-    }
-    let list: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let key = list["data"]["items"]
-        .as_array()
-        .or_else(|| list["data"].as_array())
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|t| t["name"].as_str() == Some("napi-desktop"))
-                .and_then(|t| t["key"].as_str())
-        })
-        .map(|k| k.to_string())
-        .ok_or("Token created but its key was not returned — create it in the web console")?;
-    let entry = keyring::Entry::new("napi-desktop", "api-key").map_err(|e| e.to_string())?;
-    entry.set_password(&key).map_err(|e| e.to_string())?;
-    Ok(())
+    napi_account::ensure_desktop_key(&base_url).await
 }
 
 #[tauri::command]
@@ -1330,15 +974,7 @@ async fn auto_configure_all(base_url: String) -> Result<Vec<String>, String> {
         .or_else(|| stored_token().ok().flatten())
         .ok_or(NOT_SIGNED_IN)?;
 
-    let mut results = Vec::new();
-    for agent in scan_agents() {
-        // Only agents we can actually write a config for.
-        match reconfigure_agent(agent.name.clone(), token.clone(), base_url.clone()) {
-            Ok(msg) => results.push(msg),
-            Err(e) => results.push(format!("{}: {}", agent.name, e)),
-        }
-    }
-    Ok(results)
+    Ok(agent_write::write_all_agents(&token, &base_url))
 }
 
 #[tauri::command]
@@ -1353,40 +989,107 @@ async fn auto_setup(base_url: String) -> Result<Vec<String>, String> {
 /// "No matching entry found in secure storage". Every reader used to `?` that
 /// straight through, so a signed-out app showed a raw keychain error instead of
 /// asking the user to sign in. One helper, all callers.
-fn stored_token() -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new("napi-desktop", "user-token").map_err(|e| e.to_string())?;
+pub(crate) fn stored_token() -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new("napi-desktop", "user-token").map_err(map_keyring)?;
     match entry.get_password() {
         Ok(t) if !t.is_empty() => Ok(Some(t)),
         Ok(_) => Ok(None),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(map_keyring(e)),
     }
 }
 
-fn stored_api_key() -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new("napi-desktop", "api-key").map_err(|e| e.to_string())?;
+pub(crate) fn stored_api_key() -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new("napi-desktop", "api-key").map_err(map_keyring)?;
     match entry.get_password() {
         Ok(k) if !k.is_empty() => Ok(Some(k)),
         Ok(_) => Ok(None),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(map_keyring(e)),
     }
 }
 
+fn keyring_is_duplicate(err: &keyring::Error) -> bool {
+    if matches!(err, keyring::Error::Ambiguous(_)) {
+        return true;
+    }
+    let s = err.to_string().to_lowercase();
+    s.contains("already exists") || s.contains("duplicate")
+}
+
+fn map_keyring(err: keyring::Error) -> String {
+    let s = err.to_string();
+    if keyring_is_duplicate(&err) {
+        "Could not update Keychain (an old napi-desktop item is in the way). Retry."
+            .into()
+    } else if s.contains("secure storage") {
+        format!("Could not save login in Keychain: {s}")
+    } else {
+        s
+    }
+}
+
+/// Create or replace a generic password. macOS returns
+/// "item already exists" when an older (often differently-signed) item is
+/// still in the login keychain; delete then write.
+fn set_keyring_secret(account: &str, secret: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new("napi-desktop", account).map_err(map_keyring)?;
+    match entry.get_password() {
+        Ok(existing) if existing == secret => return Ok(()),
+        _ => {}
+    }
+    match entry.set_password(secret) {
+        Ok(()) => Ok(()),
+        Err(e) if keyring_is_duplicate(&e) => {
+            let _ = entry.delete_credential();
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("security")
+                    .args([
+                        "delete-generic-password",
+                        "-s",
+                        "napi-desktop",
+                        "-a",
+                        account,
+                    ])
+                    .output();
+            }
+            match entry.set_password(secret) {
+                Ok(()) => Ok(()),
+                Err(e2) => match entry.get_password() {
+                    Ok(existing) if existing == secret => Ok(()),
+                    _ => Err(map_keyring(e2)),
+                },
+            }
+        }
+        Err(e) => Err(map_keyring(e)),
+    }
+}
+
+/// Persist the relay secret as `sk-…`. NAPI stores the raw 48-char key;
+/// clients (and the web console) always send the `sk-` prefix.
+pub(crate) fn persist_api_key(raw: &str) -> Result<String, String> {
+    let key = if raw.starts_with("sk-") {
+        raw.to_string()
+    } else {
+        format!("sk-{raw}")
+    };
+    set_keyring_secret("api-key", &key)?;
+    Ok(key)
+}
+
 /// Shown to the user when there is no usable credential.
-const NOT_SIGNED_IN: &str = "Not signed in — sign in again to continue";
+pub(crate) const NOT_SIGNED_IN: &str = "Not signed in — sign in again to continue";
 
 #[tauri::command]
 fn store_credential(token: String) -> Result<(), String> {
-    let entry = keyring::Entry::new("napi-desktop", "user-token")
-        .map_err(|e| e.to_string())?;
-    entry.set_password(&token).map_err(|e| e.to_string())?;
+    set_keyring_secret("user-token", &token)?;
     // ponytail: macOS binds a keychain item to the code signature of the binary
     // that wrote it. A fresh (ad-hoc signed) build can write successfully and
     // then read back NoEntry — which is how a "signed in" app ends up with no
     // usable credential. Verify on write so login can never leave that phantom.
-    match entry.get_password() {
-        Ok(p) if p == token => Ok(()),
+    match stored_token()? {
+        Some(p) if p == token => Ok(()),
         _ => Err("Signed in, but the system keychain would not return the credential. \
                   Remove the \"napi-desktop\" item in Keychain Access and try again."
             .into()),
@@ -1418,8 +1121,45 @@ fn check_agent_installed(binary_name: String) -> bool {
 }
 
 #[tauri::command]
+async fn install_agent(agent_id: String) -> Result<String, String> {
+    let id = agent_write::resolve_agent_id(&agent_id);
+    tokio::task::spawn_blocking(move || tool_lifecycle::install_tool(&id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn update_agent(agent_id: String) -> Result<String, String> {
+    let id = agent_write::resolve_agent_id(&agent_id);
+    tokio::task::spawn_blocking(move || tool_lifecycle::update_tool(&id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn uninstall_agent(agent_id: String, binary_name: String) -> Result<String, String> {
+    let id = agent_write::resolve_agent_id(&agent_id);
+    let config_note = match agent_write::clear_napi(&id) {
+        Ok(msg) => msg,
+        Err(e) => format!("config strip failed: {e}"),
+    };
+    let cli = tokio::task::spawn_blocking({
+        let id = id.clone();
+        move || tool_lifecycle::uninstall_tool(&id, &binary_name)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(format!("{cli}; {config_note}"))
+}
+
+#[tauri::command]
 fn launch_agent(binary_name: String) -> Result<(), String> {
     validate_binary_name(&binary_name)?;
+    if !agent_scan::cli_installed("", &binary_name) {
+        return Err(format!(
+            "{binary_name} is not installed on this Mac — Install it first"
+        ));
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -1499,9 +1239,154 @@ fn save_base_url(base_url: String) -> Result<(), String> {
     set_base_url(&base_url)
 }
 
+#[tauri::command]
+fn get_app_settings() -> agent_write::AppSettings {
+    agent_write::load_app_settings()
+}
+
+#[tauri::command]
+fn save_app_settings(settings: agent_write::AppSettings) -> Result<(), String> {
+    agent_write::save_app_settings(&settings)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedDirectories {
+    pub app_config: String,
+    pub claude: String,
+    pub codex: String,
+    pub gemini: String,
+    pub grok: String,
+    pub opencode: String,
+    pub openclaw: String,
+    pub hermes: String,
+    pub pi: String,
+}
+
+#[tauri::command]
+async fn pick_directory(default_path: Option<String>) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(path) = default_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            dialog = dialog.set_directory(path);
+        }
+        dialog
+            .pick_folder()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_resolved_directories() -> ResolvedDirectories {
+    let abs = agent_write::abs_dir_string;
+    ResolvedDirectories {
+        app_config: abs(agent_write::config_dir_for("app")),
+        claude: abs(agent_write::config_dir_for("claude")),
+        codex: abs(agent_write::config_dir_for("codex")),
+        gemini: abs(agent_write::config_dir_for("gemini")),
+        grok: abs(agent_write::config_dir_for("grok")),
+        opencode: abs(agent_write::config_dir_for("opencode")),
+        openclaw: abs(agent_write::config_dir_for("openclaw")),
+        hermes: abs(agent_write::config_dir_for("hermes")),
+        pi: abs(agent_write::config_dir_for("pi")),
+    }
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("path is empty".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(path);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        return Err("open_path is not supported on this OS".into());
+    }
+
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open path: {e}"))
+}
+
+#[tauri::command]
+fn open_logs_dir() -> Result<String, String> {
+    let dir = agent_write::config_dir_for("app").join("logs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = agent_write::abs_dir_string(dir);
+    open_path(path.clone())?;
+    Ok(path)
+}
+
+#[tauri::command]
+async fn get_tool_versions(tools: Vec<String>) -> Result<Vec<tool_versions::ToolVersion>, String> {
+    tool_versions::get_tool_versions(tools).await
+}
+
+#[tauri::command]
+fn check_env_conflicts(app: String) -> Result<Vec<env_checker::EnvConflict>, String> {
+    env_checker::check_env_conflicts(&app)
+}
+
+#[tauri::command]
+fn delete_env_vars(
+    conflicts: Vec<env_checker::EnvConflict>,
+) -> Result<env_manager::BackupInfo, String> {
+    env_manager::delete_env_vars(conflicts)
+}
+
+#[tauri::command]
+async fn fetch_user_logs(base_url: String) -> Result<serde_json::Value, String> {
+    validate_base_url(&base_url)?;
+    let token = stored_token()?.ok_or(NOT_SIGNED_IN)?;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/log/self?p=1&page_size=50&type=2",
+        base_url.trim_end_matches('/')
+    );
+    let resp = http_get_auth_with_retry(&client, &url, &token).await?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} fetching logs", resp.status()));
+    }
+    resp.json().await.map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .setup(|app| {
+            let (skills_state, skill_service) =
+                skills::init_state().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            app.manage(skills_state);
+            app.manage(skill_service);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             scan_agents,
             reconfigure_agent,
@@ -1513,6 +1398,9 @@ pub fn run() {
             load_credential,
             clear_credential,
             check_agent_installed,
+            install_agent,
+            update_agent,
+            uninstall_agent,
             launch_agent,
             get_pricing,
             get_status,
@@ -1524,7 +1412,47 @@ pub fn run() {
             scan_skills,
             fetch_registry_servers,
             install_mcp_server,
-               save_base_url,
+            get_mcp_servers,
+            upsert_mcp_server,
+            delete_mcp_server,
+            toggle_mcp_app,
+            import_mcp_from_apps,
+            validate_mcp_command,
+            save_base_url,
+            get_app_settings,
+            save_app_settings,
+            pick_directory,
+            get_resolved_directories,
+            open_path,
+            open_logs_dir,
+            get_tool_versions,
+            check_env_conflicts,
+            delete_env_vars,
+            fetch_user_logs,
+            napi_account::list_api_keys,
+            napi_account::select_api_key,
+            napi_account::fetch_weekly_usage,
+            skills::commands::get_installed_skills,
+            skills::commands::get_skill_backups,
+            skills::commands::delete_skill_backup,
+            skills::commands::install_skill_unified,
+            skills::commands::uninstall_skill_unified,
+            skills::commands::restore_skill_backup,
+            skills::commands::toggle_skill_app,
+            skills::commands::scan_unmanaged_skills,
+            skills::commands::import_skills_from_apps,
+            skills::commands::discover_available_skills,
+            skills::commands::check_skill_updates,
+            skills::commands::update_skill,
+            skills::commands::migrate_skill_storage,
+            skills::commands::search_skills_sh,
+            skills::commands::get_skills,
+            skills::commands::get_skill_repos,
+            skills::commands::add_skill_repo,
+            skills::commands::remove_skill_repo,
+            skills::commands::install_skills_from_zip,
+            skills::commands::open_zip_file_dialog,
+            skills::commands::open_external,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1598,12 +1526,14 @@ mod tests {
     fn test_scan_agents_returns_all_entries() {
         let agents = scan_agents();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
-        for expected in [
-            "claude", "codex", "cline", "opencode", "gemini", "cursor", "continue", "goose",
-            "factory", "grok", "roo", "kilocode", "hermes", "qwen", "windsurf",
-        ] {
-            assert!(ids.contains(&expected), "missing agent id: {}", expected);
+        for expected in agent_write::OVERWRITE_AGENT_IDS {
+            assert!(ids.contains(expected), "missing agent id: {}", expected);
         }
+        assert_eq!(
+            ids.len(),
+            agent_write::OVERWRITE_AGENT_IDS.len(),
+            "scan catalog and overwrite list must stay 1:1"
+        );
         // Every entry must carry the fields the UI grid renders.
         assert!(agents.iter().all(|a| !a.name.is_empty()));
         assert!(agents.iter().all(|a| !a.description.is_empty()));
@@ -1611,6 +1541,23 @@ mod tests {
         assert!(agents
             .iter()
             .all(|a| a.config_type == "auto" || a.config_type == "guide"));
+    }
+
+    #[test]
+    fn overwrite_all_does_not_skip_uninstalled_agents() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("async fn auto_configure_all")
+            .expect("auto_configure_all");
+        let body = src.get(start..start + 600).unwrap_or(&src[start..]);
+        assert!(
+            body.contains("write_all_agents"),
+            "Overwrite All must write every catalogued agent via write_all_agents"
+        );
+        assert!(
+            !body.contains("agent.installed"),
+            "Overwrite All must not gate on installed/detected"
+        );
     }
 
     #[test]
@@ -1697,12 +1644,12 @@ mod tests {
     fn test_redact_url_strips_credentials() {
         // Tokens in query strings must never survive into the UI.
         assert_eq!(
-            redact_url("https://host/mcp?token=sk-secret&x=1"),
+            crate::mcp::redact_url("https://host/mcp?token=sk-secret&x=1"),
             "https://host/mcp"
         );
-        assert_eq!(redact_url("https://host/mcp#frag"), "https://host/mcp");
-        assert_eq!(redact_url("https://host/mcp"), "https://host/mcp");
-        assert_eq!(redact_url(""), "");
+        assert_eq!(crate::mcp::redact_url("https://host/mcp#frag"), "https://host/mcp");
+        assert_eq!(crate::mcp::redact_url("https://host/mcp"), "https://host/mcp");
+        assert_eq!(crate::mcp::redact_url(""), "");
     }
 
     #[test]
@@ -1729,9 +1676,9 @@ mod tests {
 
     #[test]
     fn test_mcp_key_takes_registry_tail() {
-        assert_eq!(mcp_key("ac.inference.sh/mcp"), "mcp");
-        assert_eq!(mcp_key("ai.agentgates/mcp"), "mcp");
-        assert_eq!(mcp_key("obsidian"), "obsidian");
+        assert_eq!(crate::mcp::mcp_key("ac.inference.sh/mcp"), "mcp");
+        assert_eq!(crate::mcp::mcp_key("ai.agentgates/mcp"), "mcp");
+        assert_eq!(crate::mcp::mcp_key("obsidian"), "obsidian");
     }
 
     #[test]
@@ -1741,7 +1688,7 @@ mod tests {
             r#"{"mcpServers":{"obsidian":{"type":"http","url":"https://x"}},"other":{"keep":1}}"#,
         )
         .unwrap();
-        merge_mcp_server(&mut root, "mcp", "https://api.inference.sh/mcp", "streamable-http")
+        crate::mcp::merge_mcp_server(&mut root, "mcp", "https://api.inference.sh/mcp", "streamable-http")
             .unwrap();
         assert_eq!(root["mcpServers"]["mcp"]["url"], "https://api.inference.sh/mcp");
         assert_eq!(root["mcpServers"]["mcp"]["type"], "streamable-http");
@@ -1753,7 +1700,7 @@ mod tests {
     #[test]
     fn test_merge_mcp_server_defaults_transport() {
         let mut root = serde_json::json!({});
-        merge_mcp_server(&mut root, "thing", "https://host/mcp", "").unwrap();
+        crate::mcp::merge_mcp_server(&mut root, "thing", "https://host/mcp", "").unwrap();
         assert_eq!(root["mcpServers"]["thing"]["type"], "http");
     }
 

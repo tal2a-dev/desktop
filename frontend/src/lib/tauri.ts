@@ -20,13 +20,15 @@ interface AgentConfig {
   config_type: string;
   color: string;
   binary_name: string;
+  installable: boolean;
+  uninstallable: boolean;
 }
 
 const MOCK_AGENTS: AgentConfig[] = [
   {
     id: "claude-code",
     name: "Claude Code",
-    description: "Anthropic's CLI for agentic coding with Claude.",
+    description: "Claude Code pointed at NAPI.",
     config_path: "~/.claude/settings.json",
     key_field: "apiKey",
     base_url_field: "baseUrl",
@@ -37,11 +39,13 @@ const MOCK_AGENTS: AgentConfig[] = [
     config_type: "auto",
     color: "#d97757",
     binary_name: "claude",
+    installable: true,
+    uninstallable: true,
   },
   {
     id: "codex",
-    name: "OpenAI Codex CLI",
-    description: "OpenAI's terminal agent. Key comes from OPENAI_API_KEY.",
+    name: "Codex",
+    description: "Codex CLI, Desktop, and ChatGPT cowork (shared ~/.codex).",
     config_path: "~/.codex/config.toml",
     key_field: "",
     base_url_field: "base_url",
@@ -52,6 +56,8 @@ const MOCK_AGENTS: AgentConfig[] = [
     config_type: "auto",
     color: "#10a37f",
     binary_name: "codex",
+    installable: true,
+    uninstallable: true,
   },
   {
     id: "opencode",
@@ -67,6 +73,8 @@ const MOCK_AGENTS: AgentConfig[] = [
     config_type: "auto",
     color: "#7c3aed",
     binary_name: "opencode",
+    installable: true,
+    uninstallable: true,
   },
   {
     id: "cursor",
@@ -82,6 +90,8 @@ const MOCK_AGENTS: AgentConfig[] = [
     config_type: "guide",
     color: "#38bdf8",
     binary_name: "cursor",
+    installable: false,
+    uninstallable: false,
   },
 ];
 
@@ -182,8 +192,205 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return MOCK_AGENTS as T;
     case "configure_agent":
       return `Demo mode — ${a.agentName} not actually reconfigured.` as T;
+    case "install_agent":
+      return `Demo mode — would install ${a.agentId}.` as T;
+    case "update_agent":
+      return `Demo mode — would update ${a.agentId}.` as T;
+    case "uninstall_agent":
+      return `Demo mode — would uninstall ${a.agentId}.` as T;
+    case "check_env_conflicts":
+      return [] as T;
+    case "delete_env_vars":
+      return { backupPath: "/tmp/demo", timestamp: "", conflicts: [] } as T;
+    case "fetch_user_logs":
+      return {
+        success: true,
+        message: "",
+        data: {
+          page: 1,
+          page_size: 50,
+          total: 128,
+          items: [
+            {
+              id: 1,
+              created_at: Math.floor(Date.now() / 1000) - 3600,
+              model_name: "claude-sonnet-5",
+              prompt_tokens: 1200,
+              completion_tokens: 340,
+              quota: 25000,
+              token_name: "desktop",
+              type: 2,
+            },
+            {
+              id: 2,
+              created_at: Math.floor(Date.now() / 1000) - 7200,
+              model_name: "claude-opus-5",
+              prompt_tokens: 800,
+              completion_tokens: 210,
+              quota: 80000,
+              token_name: "desktop",
+              type: 2,
+            },
+            {
+              id: 3,
+              created_at: Math.floor(Date.now() / 1000) - 86400,
+              model_name: "",
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              quota: 500000,
+              token_name: "",
+              type: 1,
+            },
+          ],
+        },
+      } as T;
+    case "get_status":
+      return { success: true, data: { quota_per_unit: 500000 } } as T;
     case "auto_configure_all":
       return ["Demo mode — nothing was written."] as T;
+    case "get_app_settings":
+      return {
+        enableClaudePluginIntegration: true,
+        skipClaudeOnboarding: true,
+        logEnabled: true,
+        logLevel: "info",
+        selectedTokenId: 1,
+      } as T;
+    case "list_api_keys":
+      return [
+        {
+          id: 1,
+          name: "napi-desktop",
+          status: 1,
+          remainQuota: 0,
+          usedQuota: 12000,
+          unlimitedQuota: true,
+          expiredTime: -1,
+          keyMasked: "napi**********ktop",
+          selected: true,
+        },
+        {
+          id: 2,
+          name: "claude-code",
+          status: 1,
+          remainQuota: 800000,
+          usedQuota: 200000,
+          unlimitedQuota: false,
+          expiredTime: -1,
+          keyMasked: "clau**********code",
+          selected: false,
+        },
+      ] as T;
+    case "select_api_key":
+      return {
+        id: a.tokenId,
+        name: "selected",
+        status: 1,
+        remainQuota: 0,
+        usedQuota: 0,
+        unlimitedQuota: true,
+        expiredTime: -1,
+        keyMasked: "sk-demo",
+        selected: true,
+      } as T;
+    case "fetch_weekly_usage":
+      return {
+        start: Math.floor(Date.now() / 1000) - 7 * 86400,
+        end: Math.floor(Date.now() / 1000),
+        usedUsd: 12.4,
+        usedQuota: 6_200_000,
+        requestCount: 86,
+        tokenUsed: 410_000,
+        points: [],
+      } as T;
+    case "save_app_settings":
+      return undefined as T;
+    case "pick_directory":
+      return ((a.defaultPath as string | undefined) ??
+        "/Users/demo/.config/napi-desktop") as T;
+    case "get_resolved_directories":
+      return {
+        appConfig: "/Users/demo/.config/napi-desktop",
+        claude: "/Users/demo/.claude",
+        codex: "/Users/demo/.codex",
+        gemini: "/Users/demo/.gemini",
+        grok: "/Users/demo/.grok",
+        opencode: "/Users/demo/.config/opencode",
+        openclaw: "/Users/demo/.openclaw",
+        hermes: "/Users/demo/.hermes",
+        pi: "/Users/demo/.pi/agent",
+      } as T;
+    case "get_tool_versions":
+      return [
+        {
+          name: "claude",
+          version: "2.0.14",
+          latest_version: "2.1.0",
+          error: null,
+          installed_but_broken: false,
+          install_path: "/usr/local/bin/claude",
+        },
+        {
+          name: "codex",
+          version: "0.42.0",
+          latest_version: "0.42.0",
+          error: null,
+          installed_but_broken: false,
+          install_path: "/usr/local/bin/codex",
+        },
+        {
+          name: "gemini",
+          version: null,
+          latest_version: "0.9.1",
+          error: "gemini: command not found",
+          installed_but_broken: false,
+          install_path: null,
+        },
+        {
+          name: "grok",
+          version: "1.2.0",
+          latest_version: "1.3.0",
+          error: null,
+          installed_but_broken: false,
+          install_path: "/usr/local/bin/grok",
+        },
+        {
+          name: "opencode",
+          version: "0.15.0",
+          latest_version: "0.15.0",
+          error: null,
+          installed_but_broken: false,
+          install_path: "/usr/local/bin/opencode",
+        },
+        {
+          name: "openclaw",
+          version: null,
+          latest_version: "0.4.2",
+          error: null,
+          installed_but_broken: false,
+          install_path: null,
+        },
+        {
+          name: "hermes",
+          version: "0.8.1",
+          latest_version: "0.8.1",
+          error: null,
+          installed_but_broken: false,
+          install_path: "/usr/local/bin/hermes",
+        },
+        {
+          name: "pi",
+          version: "0.3.0",
+          latest_version: "0.3.0",
+          error: null,
+          installed_but_broken: true,
+          install_path: "/usr/local/bin/pi",
+        },
+      ] as T;
+    case "open_path":
+      return undefined as T;
+    case "open_logs_dir":
+      return "/Users/demo/.config/napi-desktop/logs" as T;
     case "launch_agent":
       return undefined as T;
     case "fetch_subscription":
@@ -196,8 +403,82 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return mockState.registry as T;
     case "install_mcp_server":
       return `Demo mode — ${a.name} not actually installed.` as T;
+    case "get_mcp_servers":
+      return {
+        filesystem: {
+          id: "filesystem",
+          name: "filesystem",
+          server: {
+            type: "stdio",
+            command: "npx",
+            args: ["-y", "@modelcontextprotocol/server-filesystem"],
+          },
+          apps: {
+            claude: true,
+            cursor: false,
+            codex: false,
+            gemini: false,
+            grokbuild: false,
+            opencode: false,
+            hermes: false,
+          },
+          description: "Local filesystem tools",
+        },
+      } as T;
+    case "upsert_mcp_server":
+    case "toggle_mcp_app":
+      return undefined as T;
+    case "delete_mcp_server":
+      return true as T;
+    case "import_mcp_from_apps":
+      return 2 as T;
+    case "validate_mcp_command":
+      return true as T;
     case "scan_skills":
       return mockState.skills as T;
+    case "get_installed_skills":
+      return [
+        {
+          id: "local:commit",
+          name: "commit",
+          description: "Write conventional commits",
+          directory: "commit",
+          apps: {
+            claude: true,
+            codex: false,
+            gemini: false,
+            grokbuild: false,
+            opencode: true,
+            openclaw: false,
+            hermes: false,
+            pi: false,
+            mcode: false,
+          },
+          installedAt: 0,
+          updatedAt: 0,
+        },
+      ] as T;
+    case "get_skill_backups":
+    case "scan_unmanaged_skills":
+    case "discover_available_skills":
+    case "check_skill_updates":
+    case "get_skills":
+      return [] as T;
+    case "get_skill_repos":
+      return [
+        { owner: "anthropics", name: "skills", branch: "main", enabled: true },
+      ] as T;
+    case "search_skills_sh":
+      return { skills: [], totalCount: 0, query: String(a.query ?? "") } as T;
+    case "open_zip_file_dialog":
+      return null as T;
+    case "open_external":
+      return undefined as T;
+    case "delete_skill_backup":
+    case "add_skill_repo":
+    case "remove_skill_repo":
+    case "toggle_skill_app":
+      return true as T;
     default:
       throw new Error(`Unknown command in demo mode: ${cmd}`);
   }

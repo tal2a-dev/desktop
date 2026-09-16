@@ -1,13 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "../lib/tauri.ts";
-import type { StatusDetail } from "../App";
-
-interface McpServer {
-  name: string;
-  agent: string;
-  kind: string;
-  target: string;
-}
+import type { StatusDetail } from "../App.tsx";
+import { UnifiedMcpPanel } from "@/components/mcp/UnifiedMcpPanel.tsx";
+import type { ScannedMcpServer } from "@/types/mcp.ts";
 
 interface RegistryServer {
   name: string;
@@ -80,19 +75,12 @@ const subFromHash = (): Tab =>
 
 export function McpLibraryPage() {
   const [tab, setTab] = useState<Tab>(subFromHash);
-  const [servers, setServers] = useState<McpServer[]>([]);
-  // Own filter state per subtab so switching tabs and Load-more keep the query.
-  const [qInst, setQInst] = useState("");
+  const [managedCount, setManagedCount] = useState(0);
   const [qReg, setQReg] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [scanError, setScanError] = useState<string | null>(null);
-  const [open, setOpen] = useState<string | null>(null);
-
   const [registry, setRegistry] = useState<RegistryServer[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [regLoading, setRegLoading] = useState(false);
   const [regError, setRegError] = useState<string | null>(null);
-  // Per-row parallel busy: concurrent installs never lock each other out.
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
@@ -100,7 +88,6 @@ export function McpLibraryPage() {
   const pushToast = useCallback((msg: string, kind: Toast["kind"]) => {
     toastId.current += 1;
     const id = toastId.current;
-    // Stack, never overwrite; cap at 3, oldest drops first.
     setToasts((prev) => [...prev.slice(-2), { id, msg, kind }]);
     setTimeout(
       () => setToasts((prev) => prev.filter((t) => t.id !== id)),
@@ -113,31 +100,6 @@ export function McpLibraryPage() {
     [],
   );
 
-  const scan = useCallback(
-    () =>
-      invoke<McpServer[]>("scan_mcp_servers")
-        .then((s) => {
-          setServers(s);
-          setScanError(null);
-        })
-        .catch((e) => {
-          setServers([]);
-          setScanError(String(e));
-        }),
-    [],
-  );
-
-  useEffect(() => {
-    scan().finally(() => setLoading(false));
-  }, [scan]);
-
-  const retryScan = useCallback(() => {
-    setLoading(true);
-    setScanError(null);
-    scan().finally(() => setLoading(false));
-  }, [scan]);
-
-  // Subtabs persist to #/mcp/installed | #/mcp/registry (App matches by prefix).
   useEffect(() => {
     const onHash = () => {
       if (window.location.hash.startsWith("#/mcp")) setTab(subFromHash());
@@ -152,14 +114,13 @@ export function McpLibraryPage() {
       window.location.hash = t === "registry" ? "#/mcp/registry" : "#/mcp/installed";
   };
 
-  // Statusline: MCP count + backend errors.
   useEffect(() => {
     const detail: StatusDetail = {
-      mcp: `${servers.length} MCP`,
-      backendError: scanError ?? regError ?? null,
+      mcp: `${managedCount} MCP`,
+      backendError: regError ?? null,
     };
     window.dispatchEvent(new CustomEvent("napi:status", { detail }));
-  }, [servers.length, scanError, regError]);
+  }, [managedCount, regError]);
 
   const loadRegistry = useCallback(async (next?: string | null) => {
     setRegLoading(true);
@@ -178,15 +139,9 @@ export function McpLibraryPage() {
     }
   }, []);
 
-  // Lazy-once: fetch on first visit to the Registry subtab only.
   useEffect(() => {
-    if (
-      tab === "registry" &&
-      registry.length === 0 &&
-      !regError &&
-      !regLoading
-    ) {
-      loadRegistry(null);
+    if (tab === "registry" && registry.length === 0 && !regError && !regLoading) {
+      void loadRegistry(null);
     }
   }, [tab, registry.length, regError, regLoading, loadRegistry]);
 
@@ -194,7 +149,7 @@ export function McpLibraryPage() {
     setCursor(null);
     setRegistry([]);
     setRegError(null);
-    loadRegistry(null);
+    void loadRegistry(null);
   }, [loadRegistry]);
 
   const install = async (s: RegistryServer) => {
@@ -206,11 +161,15 @@ export function McpLibraryPage() {
         transport: s.transport,
       });
       pushToast(msg, "success");
-      await scan();
-      // refresh the installed flag on the clicked row
       setRegistry((prev) =>
         prev.map((r) => (r.name === s.name ? { ...r, installed: true } : r)),
       );
+      try {
+        const scanned = await invoke<ScannedMcpServer[]>("scan_mcp_servers");
+        setManagedCount(scanned.length);
+      } catch {
+        /* ignore */
+      }
     } catch (e) {
       pushToast(String(e), "error");
     } finally {
@@ -222,40 +181,7 @@ export function McpLibraryPage() {
     }
   };
 
-  if (loading)
-    return (
-      <div>
-        <div className="page-head">
-          <div>
-            <h2>MCP Library</h2>
-            <p className="page-sub">Scanning agent configs…</p>
-          </div>
-        </div>
-        <SkeletonList label="Loading MCP servers" />
-        <ToastStack toasts={toasts} onDismiss={dismissToast} />
-      </div>
-    );
-
-  const match = (t: string, needle: string) =>
-    t.toLowerCase().includes(needle);
-
-  const instNeedle = qInst.trim().toLowerCase();
-  const shown = instNeedle
-    ? servers.filter(
-        (s) =>
-          match(s.name, instNeedle) ||
-          match(s.agent, instNeedle) ||
-          match(s.target, instNeedle),
-      )
-    : servers;
-
-  const agentCount = new Set(servers.map((s) => s.agent)).size;
-
-  const byAgent = shown.reduce<Record<string, McpServer[]>>((acc, s) => {
-    (acc[s.agent] ||= []).push(s);
-    return acc;
-  }, {});
-
+  const match = (t: string, needle: string) => t.toLowerCase().includes(needle);
   const regNeedle = qReg.trim().toLowerCase();
   const regShown = regNeedle
     ? registry.filter(
@@ -267,70 +193,38 @@ export function McpLibraryPage() {
     : registry;
 
   return (
-    <div>
-      <div className="page-head">
+    <div className="flex min-h-0 flex-1 flex-col px-6 py-4">
+      <div className="mb-4 flex items-start justify-between gap-3">
         <div>
-          <h2>MCP Library</h2>
-          <p className="page-sub">
+          <p className="text-sm text-muted-foreground">
             {tab === "installed"
-              ? `${servers.length} servers across ${agentCount} agents`
+              ? `${managedCount} managed servers · writes agent mcpServers`
               : `${registry.length} listed · public MCP registry`}
           </p>
-          <div className="lib-chips" style={{ margin: "8px 0 0" }}>
-            {tab === "installed" ? (
-              <span className="chip">
-                <b>{servers.length}</b>&nbsp;({shown.length} shown)
-              </span>
-            ) : (
-              <span className="chip">
-                showing&nbsp;<b>{regShown.length}</b>&nbsp;of {registry.length}{" "}
-                loaded
-              </span>
-            )}
+        </div>
+        {tab === "registry" ? (
+          <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+            <input
+              className="search-input"
+              placeholder="Filter registry…"
+              value={qReg}
+              onChange={(e) => setQReg(e.target.value)}
+            />
+            <button
+              className="btn-secondary"
+              style={{ minHeight: 32, padding: "5px 14px", fontSize: 12 }}
+              onClick={refreshRegistry}
+              disabled={regLoading}
+              title="Reload the registry from the first page"
+            >
+              {regLoading && registry.length === 0 ? (
+                <span className="spinner" aria-hidden="true" />
+              ) : (
+                "Refresh"
+              )}
+            </button>
           </div>
-        </div>
-        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-          {tab === "installed" ? (
-            <>
-              <input
-                className="search-input"
-                placeholder="Filter servers…"
-                value={qInst}
-                onChange={(e) => setQInst(e.target.value)}
-              />
-              <button
-                className="btn-secondary"
-                style={{ minHeight: 32, padding: "5px 14px", fontSize: 12 }}
-                onClick={retryScan}
-                title="Re-scan agent configs"
-              >
-                Refresh
-              </button>
-            </>
-          ) : (
-            <>
-              <input
-                className="search-input"
-                placeholder="Filter registry…"
-                value={qReg}
-                onChange={(e) => setQReg(e.target.value)}
-              />
-              <button
-                className="btn-secondary"
-                style={{ minHeight: 32, padding: "5px 14px", fontSize: 12 }}
-                onClick={refreshRegistry}
-                disabled={regLoading}
-                title="Reload the registry from the first page (keeps your filter)"
-              >
-                {regLoading && registry.length === 0 ? (
-                  <span className="spinner" aria-hidden="true" />
-                ) : (
-                  "Refresh"
-                )}
-              </button>
-            </>
-          )}
-        </div>
+        ) : null}
       </div>
 
       <div className="subtabs" role="tablist" aria-label="MCP Library views">
@@ -352,117 +246,15 @@ export function McpLibraryPage() {
         </button>
       </div>
 
-      {tab === "installed" && (
-        <>
-          {scanError && servers.length === 0 && (
-            <>
-              <div className="error-banner">{scanError}</div>
-              <div style={{ marginTop: 12 }}>
-                <button className="btn-secondary" onClick={retryScan}>
-                  Retry scan
-                </button>
-              </div>
-            </>
-          )}
-          {!scanError && servers.length === 0 && (
-            <div className="empty-state">
-              <div className="empty-state-icon" aria-hidden="true">
-                ▣
-              </div>
-              <h3>No MCP servers found</h3>
-              <p>No agent config on this machine exposes MCP servers yet.</p>
-              <button className="btn-secondary" onClick={retryScan}>
-                Retry scan
-              </button>
-            </div>
-          )}
-          {servers.length > 0 && shown.length === 0 && (
-            <div className="empty-state">
-              <div className="empty-state-icon" aria-hidden="true">
-                ⌕
-              </div>
-              <h3>No matches</h3>
-              <p>No installed server matches “{qInst.trim()}”.</p>
-              <button className="btn-secondary" onClick={() => setQInst("")}>
-                Clear filter
-              </button>
-            </div>
-          )}
-          {Object.entries(byAgent).map(([agent, list]) => (
-            <div key={agent} className="lib-group">
-              <h3 className="section-heading">
-                {agent} <span className="lib-count">{list.length}</span>
-              </h3>
-              <div className="lib-list">
-                {list.map((s) => {
-                  const key = `${agent}-${s.name}`;
-                  const isOpen = open === key;
-                  return (
-                    <div key={key}>
-                      <div className="lib-row">
-                        <span className="lib-name" title={s.name}>
-                          {s.name}
-                        </span>
-                        <span
-                          className={`lib-kind ${s.kind}`}
-                          title="Transport kind"
-                        >
-                          {s.kind || "—"}
-                        </span>
-                        <span style={{ flex: 1 }} />
-                        <button
-                          className="chev-btn"
-                          aria-expanded={isOpen}
-                          aria-label={
-                            isOpen
-                              ? `Collapse ${s.name} details`
-                              : `Expand ${s.name} details`
-                          }
-                          title={isOpen ? "Collapse" : "Expand"}
-                          onClick={() => setOpen(isOpen ? null : key)}
-                        >
-                          {isOpen ? "▾" : "▸"}
-                        </button>
-                      </div>
-                      {isOpen && (
-                        <div
-                          className="lib-row compact"
-                          style={{ alignItems: "flex-start" }}
-                        >
-                          <span
-                            className="lib-target"
-                            title={s.target || "No target recorded"}
-                            style={{ flex: 1 }}
-                          >
-                            {s.target || "—"}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
-          {servers.length > 0 && (
-            <p className="page-sub" style={{ marginTop: 12 }}>
-              Targets exclude credentials — the backend strips query strings
-              and fragments.
-            </p>
-          )}
-        </>
-      )}
-
-      {tab === "registry" && (
+      {tab === "installed" ? (
+        <UnifiedMcpPanel onCountChange={setManagedCount} />
+      ) : (
         <>
           {regError && (
             <>
               <div className="error-banner">{regError}</div>
               <div style={{ marginTop: 12 }}>
-                <button
-                  className="btn-secondary"
-                  onClick={() => loadRegistry(null)}
-                >
+                <button className="btn-secondary" onClick={() => void loadRegistry(null)}>
                   Retry
                 </button>
               </div>
@@ -472,17 +264,17 @@ export function McpLibraryPage() {
             <SkeletonList label="Loading registry" />
           )}
           {!regError && !regLoading && registry.length === 0 && (
-              <div className="empty-state">
-                <div className="empty-state-icon" aria-hidden="true">
-                  ▣
-                </div>
-                <h3>Registry is empty</h3>
-                <p>The public registry returned no servers.</p>
-                <button className="btn-secondary" onClick={refreshRegistry}>
-                  Refresh registry
-                </button>
+            <div className="empty-state">
+              <div className="empty-state-icon" aria-hidden="true">
+                ▣
               </div>
-            )}
+              <h3>Registry is empty</h3>
+              <p>The public registry returned no servers.</p>
+              <button className="btn-secondary" onClick={refreshRegistry}>
+                Refresh registry
+              </button>
+            </div>
+          )}
           {!regError && registry.length > 0 && regShown.length === 0 && (
             <div className="empty-state">
               <div className="empty-state-icon" aria-hidden="true">
@@ -515,10 +307,7 @@ export function McpLibraryPage() {
                       {r.installed && (
                         <span className="pill pill-configured">Installed</span>
                       )}
-                      <span
-                        className="lib-kind"
-                        title="Endpoint transport type"
-                      >
+                      <span className="lib-kind" title="Endpoint transport type">
                         {r.transport || "—"}
                       </span>
                       <span className="lib-target">
@@ -533,7 +322,7 @@ export function McpLibraryPage() {
                       disabled={!r.url || isBusy || r.installed}
                       title={why}
                       aria-label={`${r.installed ? "Installed" : "Install"} ${r.title || r.name}`}
-                      onClick={() => install(r)}
+                      onClick={() => void install(r)}
                     >
                       {r.installed ? (
                         "Installed"
@@ -553,15 +342,14 @@ export function McpLibraryPage() {
               {cursor
                 ? `showing ${registry.length} loaded · more available`
                 : `${registry.length} shown`}
-              {" · "}Install writes to the Claude Code config
-              (~/.claude.json) only. Registry data is public — no key required.
+              {" · "}Install writes ~/.claude.json and the unified MCP library.
             </p>
           )}
           {cursor && !regError && (
             <button
               className="btn-inline load-more"
               disabled={regLoading}
-              onClick={() => loadRegistry(cursor)}
+              onClick={() => void loadRegistry(cursor)}
             >
               {regLoading ? (
                 <span className="spinner" aria-hidden="true" />

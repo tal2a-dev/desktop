@@ -1,4 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button.tsx";
+import { Input } from "@/components/ui/input.tsx";
+import { cn } from "@/lib/utils.ts";
+import { AgentIcon } from "@/components/AgentIcon.tsx";
 import { invoke } from "../lib/tauri.ts";
 import { useAuth } from "../lib/auth";
 
@@ -16,6 +21,8 @@ interface AgentConfig {
   config_type: string;
   color: string;
   binary_name: string;
+  installable: boolean;
+  uninstallable: boolean;
 }
 
 type Status = "not-installed" | "not-configured" | "configured" | "guide";
@@ -50,83 +57,28 @@ const FILTERS: { id: Filter; label: string }[] = [
   { id: "not-installed", label: "Not installed" },
 ];
 
-interface Toast {
-  id: number;
-  msg: string;
-  kind: "success" | "error";
-}
-
-const TOAST_ICON: Record<Toast["kind"], string> = {
-  success: "✓",
-  error: "✕",
-};
-
-function ToastStack({
-  toasts,
-  onDismiss,
-}: {
-  toasts: Toast[];
-  onDismiss: (id: number) => void;
-}) {
-  if (toasts.length === 0) return null;
-  return (
-    <div className="toasts" aria-live="polite">
-      {toasts.map((t) => (
-        <div key={t.id} className={`toast toast-${t.kind}`} role="status">
-          <span aria-hidden="true">{TOAST_ICON[t.kind]}</span>
-          <span>{t.msg}</span>
-          <button
-            className="toast-x"
-            onClick={() => onDismiss(t.id)}
-            aria-label="Dismiss notification"
-          >
-            X
-          </button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function impactOf(a: AgentConfig, baseUrl: string): string {
   const st = statusOf(a);
   if (st === "guide") return "Skipped — manual setup";
   if (st === "configured") return `Overwrite with endpoint ${baseUrl}`;
-  if (st === "not-installed") return "Not installed — setup will be attempted";
+  if (st === "not-installed")
+    return `Write NAPI config now (ready when ${a.name} is installed)`;
   return `Will configure with endpoint ${baseUrl}`;
 }
 
 export function AgentsPage() {
   const { state } = useAuth();
   const [agents, setAgents] = useState<AgentConfig[]>([]);
-  const [openId, setOpenId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [loading, setLoading] = useState(true);
   const [scanError, setScanError] = useState<string | null>(null);
-  const [toasts, setToasts] = useState<Toast[]>([]);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [copied, setCopied] = useState<string | null>(null);
-  const [lastRun, setLastRun] = useState<Record<string, string>>({});
-  const [inlineErr, setInlineErr] = useState<Record<string, string>>({});
-  const toastId = useRef(0);
-
-  const pushToast = useCallback((msg: string, kind: Toast["kind"]) => {
-    toastId.current += 1;
-    const id = toastId.current;
-    // Stack, never overwrite; cap at 3, oldest drops first.
-    setToasts((prev) => [...prev.slice(-2), { id, msg, kind }]);
-    setTimeout(
-      () => setToasts((prev) => prev.filter((t) => t.id !== id)),
-      6000,
-    );
-  }, []);
-
-  const dismissToast = useCallback(
-    (id: number) => setToasts((prev) => prev.filter((t) => t.id !== id)),
-    [],
+  const [uninstallTarget, setUninstallTarget] = useState<AgentConfig | null>(
+    null,
   );
+  const [inlineErr, setInlineErr] = useState<Record<string, string>>({});
 
   const scan = useCallback(async () => {
     setLoading(true);
@@ -143,7 +95,20 @@ export function AgentsPage() {
   }, []);
 
   useEffect(() => {
-    scan();
+    void scan();
+  }, [scan]);
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible") void scan();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    const onFocus = () => void scan();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [scan]);
 
   // ponytail: one click — the API key is read from the keyring in Rust, never typed.
@@ -156,14 +121,13 @@ export function AgentsPage() {
     });
     try {
       const msg = await invoke<string>("configure_agent", {
-        agentName: a.name,
+        agentName: a.id,
         baseUrl: state.baseUrl,
       });
-      pushToast(msg, "success");
-      setLastRun((m) => ({ ...m, [a.id]: msg }));
+      toast.success(msg);
       await scan();
     } catch (e) {
-      pushToast(String(e), "error");
+      toast.error(String(e));
       setInlineErr((m) => ({ ...m, [a.id]: String(e) }));
     } finally {
       setBusy(null);
@@ -176,11 +140,48 @@ export function AgentsPage() {
       const msgs = await invoke<string[]>("auto_configure_all", {
         baseUrl: state.baseUrl,
       });
-      pushToast(`Configured ${msgs.length} agents`, "success");
+      toast.success(`Configured ${msgs.length} agents`);
       setConfirmOpen(false);
       await scan();
     } catch (e) {
-      pushToast(String(e), "error");
+      toast.error(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const installCli = async (a: AgentConfig) => {
+    setBusy(a.id);
+    setInlineErr((m) => {
+      const next = { ...m };
+      delete next[a.id];
+      return next;
+    });
+    try {
+      const msg = await invoke<string>("install_agent", { agentId: a.id });
+      toast.success(msg || `Installed ${a.name}`);
+      await scan();
+    } catch (e) {
+      toast.error(String(e));
+      setInlineErr((m) => ({ ...m, [a.id]: String(e) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const uninstallCli = async (a: AgentConfig) => {
+    setBusy(a.id);
+    setUninstallTarget(null);
+    try {
+      const msg = await invoke<string>("uninstall_agent", {
+        agentId: a.id,
+        binaryName: a.binary_name,
+      });
+      toast.success(msg || `Uninstalled ${a.name}`);
+      await scan();
+    } catch (e) {
+      toast.error(String(e));
+      setInlineErr((m) => ({ ...m, [a.id]: String(e) }));
     } finally {
       setBusy(null);
     }
@@ -194,24 +195,10 @@ export function AgentsPage() {
     });
     try {
       await invoke("launch_agent", { binaryName: a.binary_name });
-      pushToast(`Launched ${a.binary_name}`, "success");
-      setLastRun((m) => ({ ...m, [a.id]: `Launched ${a.binary_name}` }));
+      toast.success(`Launched ${a.binary_name}`);
     } catch (e) {
-      pushToast(String(e), "error");
+      toast.error(String(e));
       setInlineErr((m) => ({ ...m, [a.id]: String(e) }));
-    }
-  };
-
-  const copyPath = async (a: AgentConfig) => {
-    try {
-      await navigator.clipboard.writeText(a.config_path);
-      setCopied(a.id);
-      window.setTimeout(
-        () => setCopied((cur) => (cur === a.id ? null : cur)),
-        1500,
-      );
-    } catch {
-      // Clipboard unavailable — the path text stays selectable.
     }
   };
 
@@ -246,51 +233,49 @@ export function AgentsPage() {
   const busyAny = busy !== null;
 
   return (
-    <div>
-      <div className="page-head">
+    <div className="px-6 py-4">
+      <div className="mb-4 flex items-start justify-between gap-3">
         <div>
-          <h2>CLI Tools</h2>
-          <p className="page-sub">
-            {counts.configured} of {agents.length} configured · endpoint{" "}
-            {state.baseUrl}
+          <p className="text-sm text-muted-foreground">
+            {counts.configured} of {agents.length} pointed at {state.baseUrl}
           </p>
         </div>
-        <button
-          className="btn-secondary"
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void scan()}
+          disabled={busyAny || loading}
+        >
+          {loading ? "Scanning…" : "Scan"}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
           onClick={() => setConfirmOpen(true)}
           disabled={busyAny || loading || agents.length === 0}
         >
-          Set up all
-        </button>
+          Overwrite all
+        </Button>
       </div>
 
-      <div
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          gap: 8,
-          alignItems: "center",
-          marginBottom: 16,
-        }}
-      >
-        <input
-          className="search-input"
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <Input
+          className="h-9 min-w-[220px] flex-1"
           type="search"
           aria-label="Filter agents by name, description, or config path"
-          placeholder="Filter agents…"
+          placeholder="Search agents…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
         <div
-          className="subtabs"
+          className="flex flex-wrap gap-1"
           role="group"
           aria-label="Filter agents by status"
-          style={{ marginBottom: 0 }}
         >
           {FILTERS.map((f) => (
             <button
               key={f.id}
-              className={`subtab ${filter === f.id ? "active" : ""}`}
+              className={`rounded-md px-2.5 py-1 text-xs ${filter === f.id ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted"}`}
               aria-pressed={filter === f.id}
               onClick={() => setFilter(f.id)}
             >
@@ -384,119 +369,89 @@ export function AgentsPage() {
       )}
 
       {filtered.length > 0 && (
-        <div className="tool-grid">
+        <div className="flex flex-col gap-3">
           {filtered.map((a) => {
             const st = statusOf(a);
-            const isOpen = openId === a.id;
-            const panelId = `agent-panel-${a.id}`;
+            const live = st === "configured";
             return (
               <div
                 key={a.id}
-                className={`tool-card ${st} ${isOpen ? "open" : ""}`}
+                className={cn(
+                  "relative overflow-hidden rounded-xl border border-border bg-card p-4 text-card-foreground transition-all duration-300",
+                  live
+                    ? "border-blue-500/60 shadow-sm shadow-blue-500/10"
+                    : "hover:border-border-hover hover:shadow-sm",
+                )}
               >
-                <div className="tool-card-top">
-                  <span className="tool-ident">
-                    <span
-                      className="tool-tile"
-                      style={{ background: a.color }}
-                      aria-hidden="true"
-                    >
-                      {a.name.charAt(0)}
-                    </span>
-                    <span className="tool-name">{a.name}</span>
-                  </span>
-                  <span style={{ flex: 1 }} />
-                  <span className={PILL_CLASS[st]}>{STATUS_LABEL[st]}</span>
-                  <button
-                    className="chev-btn"
-                    aria-expanded={isOpen}
-                    aria-controls={panelId}
-                    aria-label={
-                      isOpen
-                        ? `Collapse ${a.name} details`
-                        : `Expand ${a.name} details`
-                    }
-                    title={isOpen ? "Collapse" : "Expand"}
-                    onClick={() => setOpenId(isOpen ? null : a.id)}
-                  >
-                    {isOpen ? "▾" : "▸"}
-                  </button>
-                </div>
-
-                {isOpen && (
-                  <div className="tool-body" id={panelId}>
-                    <p className="tool-desc" title={a.description}>
-                      {a.description}
-                    </p>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "flex-start",
-                        gap: 8,
-                      }}
-                    >
-                      <span className="tool-path" style={{ flex: 1 }}>
-                        {a.config_path}
-                      </span>
-                      <button
-                        className="btn-inline"
-                        title="Copy config path"
-                        onClick={() => copyPath(a)}
-                      >
-                        {copied === a.id ? "Copied" : "Copy"}
-                      </button>
+                {live && (
+                  <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-blue-500/10 to-transparent" />
+                )}
+                <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 flex-1 items-center gap-3">
+                    <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-border bg-muted">
+                      <AgentIcon id={a.id} name={a.name} size={20} />
                     </div>
-                    <div className="tool-path" style={{ marginTop: 6 }}>
-                      endpoint {state.baseUrl}
-                    </div>
-
-                    {st === "guide" ? (
-                      <div className="tool-note">
-                        {a.name} manages credentials in its own settings UI —
-                        configure it manually with endpoint {state.baseUrl}
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex min-h-7 flex-wrap items-center gap-2">
+                        <h3 className="truncate text-base font-semibold leading-none">
+                          {a.name}
+                        </h3>
+                        <span className={PILL_CLASS[st]}>{STATUS_LABEL[st]}</span>
                       </div>
-                    ) : (
-                      <div className="tool-actions">
-                        <button
-                          className="btn-primary"
-                          style={{ minHeight: 32, padding: "5px 14px", fontSize: 12 }}
-                          onClick={() => quickSetup(a)}
-                          disabled={busy === a.id || busy === "__all__"}
-                        >
-                          {busy === a.id ? (
-                            <span className="spinner" aria-hidden="true" />
-                          ) : st === "configured" ? (
-                            "Overwrite"
-                          ) : (
-                            "Quick Setup"
-                          )}
-                        </button>
-                        {a.installed && (
-                          <button
-                            className="btn-secondary"
-                            style={{ minHeight: 32, padding: "5px 14px", fontSize: 12 }}
-                            onClick={() => launch(a)}
-                          >
-                            Launch in Terminal
-                          </button>
-                        )}
-                      </div>
-                    )}
-                    {lastRun[a.id] && (
-                      <p className="page-sub" role="status" style={{ marginTop: 8 }}>
-                        Last run: {lastRun[a.id]}
+                      <p className="truncate text-sm text-muted-foreground">
+                        {a.description || a.config_path}
                       </p>
-                    )}
-                    {inlineErr[a.id] && (
-                      <div
-                        className="error-banner"
-                        role="alert"
-                        style={{ marginTop: 8 }}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {!a.installed && a.installable && (
+                      <Button
+                        size="sm"
+                        variant="default"
+                        disabled={busy === a.id || busy === "__all__"}
+                        onClick={() => void installCli(a)}
                       >
-                        {inlineErr[a.id]}
-                      </div>
+                        {busy === a.id ? "Installing…" : "Install"}
+                      </Button>
+                    )}
+                    {a.config_type === "auto" && (
+                      <Button
+                        size="sm"
+                        variant={live ? "outline" : "default"}
+                        disabled={busy === a.id || busy === "__all__"}
+                        onClick={() => void quickSetup(a)}
+                      >
+                        {busy === a.id
+                          ? "Writing…"
+                          : live
+                            ? "Overwrite"
+                            : "Enable"}
+                      </Button>
+                    )}
+                    {a.installed && (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => void launch(a)}
+                        >
+                          Launch
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="text-red-400 hover:text-red-300"
+                          disabled={busy === a.id || busy === "__all__"}
+                          onClick={() => setUninstallTarget(a)}
+                        >
+                          Uninstall
+                        </Button>
+                      </>
                     )}
                   </div>
+                </div>
+                {inlineErr[a.id] && (
+                  <p className="relative mt-2 text-xs text-red-400">{inlineErr[a.id]}</p>
                 )}
               </div>
             );
@@ -518,8 +473,9 @@ export function AgentsPage() {
           >
             <h2 id="setup-all-title">Set up all agents?</h2>
             <p className="page-sub">
-              Each config is overwritten with endpoint {state.baseUrl}. The API
-              key is read from the keyring — nothing is typed.
+              Every known agent config is overwritten with endpoint{" "}
+              {state.baseUrl}, including tools that are not installed on this
+              machine. The API key is read from the keyring — nothing is typed.
             </p>
             <ul className="modal-impact">
               {agents.map((a) => (
@@ -552,7 +508,39 @@ export function AgentsPage() {
         </div>
       )}
 
-      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+      {uninstallTarget && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setUninstallTarget(null)}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2>Uninstall {uninstallTarget.name}?</h2>
+            <p className="page-sub">
+              Removes this harness&apos;s CLI and desktop app when we know them,
+              and strips the NAPI overlay from its original config (Claude,
+              Codex, OpenCode, Cursor, Gemini, Grok, Cline, Continue, Pi,
+              Hermes, Qwen, Goose, Factory, Roo, Kilo, OpenClaw, Windsurf).
+              History and project files stay.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setUninstallTarget(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => void uninstallCli(uninstallTarget)}
+              >
+                Uninstall
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

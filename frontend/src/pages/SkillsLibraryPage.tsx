@@ -1,253 +1,156 @@
-import { useState, useEffect, useCallback } from "react";
-import { invoke } from "../lib/tauri.ts";
-
-interface SkillInfo {
-  name: string;
-  agent: string;
-}
-
-const PAGE_STEP = 80;
-
-// ponytail: mirrors the scan_skills source dirs in src-tauri/src/lib.rs so rows can
-// show/copy each SKILL.md path without a new Tauri command. Update both if sources change.
-const SKILL_DIRS: Record<string, string> = {
-  "Claude Code": ".claude/skills",
-  OpenCode: ".config/opencode/skills",
-  Cline: ".cline/skills",
-  Roo: ".roo/skills",
-  "Kilo Code": ".kilocode/skills",
-  "Grok CLI": ".grok/skills",
-  "Qwen Code": ".qwen/skills",
-  Hermes: ".hermes/skills",
-};
-
-function skillRelPath(agent: string, name: string): string {
-  return `~/${SKILL_DIRS[agent] ?? ".skills"}/${name}/SKILL.md`;
-}
+import { useRef, useState } from "react";
+import {
+  Download,
+  FolderArchive,
+  History,
+  Loader2,
+  RefreshCw,
+  Search,
+  Settings,
+} from "lucide-react";
+import UnifiedSkillsPanel, {
+  type SkillsCheckUpdatesState,
+  type UnifiedSkillsPanelHandle,
+} from "@/components/skills/UnifiedSkillsPanel";
+import {
+  SkillsPage,
+  getSkillsPageHeaderActions,
+  type SkillsPageHandle,
+  type SkillsPageSource,
+} from "@/components/skills/SkillsPage";
+import { Button } from "@/components/ui/button";
+import { useScanUnmanagedSkills } from "@/hooks/useSkills";
+import { useTranslation } from "@/i18n";
 
 export function SkillsLibraryPage() {
-  const [skills, setSkills] = useState<SkillInfo[]>([]);
-  const [q, setQ] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [limits, setLimits] = useState<Record<string, number>>({});
-  const [copied, setCopied] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    setLoading(true);
-    invoke<SkillInfo[]>("scan_skills")
-      .then(setSkills)
-      .catch(() => setSkills([]))
-      .finally(() => setLoading(false));
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const copyText = async (key: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(key);
-      window.setTimeout(
-        () => setCopied((cur) => (cur === key ? null : cur)),
-        1500,
-      );
-    } catch {
-      // Clipboard unavailable — the name/path text stays selectable.
-    }
-  };
-
-  if (loading)
-    return (
-      <div>
-        <div className="page-head">
-          <div>
-            <h2>Skills Library</h2>
-            <p className="page-sub">Scanning installed skills…</p>
-          </div>
-        </div>
-        <div className="skeleton-list" role="status" aria-label="Loading skills">
-          {Array.from({ length: 8 }).map((_, i) => (
-            <div className="skeleton" key={i} style={{ height: 33 }} />
-          ))}
-        </div>
-      </div>
-    );
-
-  const needle = q.trim().toLowerCase();
-  const matches = needle
-    ? skills.filter(
-        (s) =>
-          s.name.toLowerCase().includes(needle) ||
-          s.agent.toLowerCase().includes(needle),
-      )
-    : skills;
-
-  const byAgent = matches.reduce<Record<string, string[]>>((acc, s) => {
-    (acc[s.agent] ||= []).push(s.name);
-    return acc;
-  }, {});
-
-  const totals = skills.reduce<Record<string, number>>((acc, s) => {
-    acc[s.agent] = (acc[s.agent] || 0) + 1;
-    return acc;
-  }, {});
+  const { t } = useTranslation();
+  const panelRef = useRef<UnifiedSkillsPanelHandle>(null);
+  const pageRef = useRef<SkillsPageHandle>(null);
+  const [view, setView] = useState<"manage" | "discover">("manage");
+  const [source, setSource] = useState<SkillsPageSource>("repos");
+  const [busy, setBusy] = useState(false);
+  const [checkState, setCheckState] = useState<SkillsCheckUpdatesState>({
+    isChecking: false,
+    hasSkills: false,
+  });
+  const { data: unmanagedSkills } = useScanUnmanagedSkills();
+  const hasUnmanagedSkills = (unmanagedSkills?.length ?? 0) > 0;
 
   return (
-    <div>
-      <div className="page-head">
+    <div className="flex h-full min-h-0 flex-col px-6 py-4">
+      <div className="mb-4 flex items-start justify-between gap-3">
         <div>
-          <h2>Skills Library</h2>
-          <p className="page-sub">
-            {skills.length} skills across {Object.keys(totals).length} agents (
-            {matches.length} shown)
-          </p>
+          <h2>{view === "manage" ? t("skills.manage") : t("skills.discover")}</h2>
+          <p className="page-sub">{t("skills.description")}</p>
         </div>
-        <input
-          className="search-input"
-          type="search"
-          aria-label="Filter skills by name or agent"
-          placeholder="Filter skills…"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-        />
+        <div className="flex flex-wrap items-center gap-1">
+          {view === "discover" ? (
+            <>
+              <Button variant="ghost" size="sm" onClick={() => setView("manage")}>
+                {t("common.back")}
+              </Button>
+              {getSkillsPageHeaderActions(source).map(({ key, labelKey, Icon, execute }) => (
+                <Button
+                  key={key}
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => execute(pageRef.current)}
+                >
+                  {key === "manage-repos" ? (
+                    <Settings className="mr-2 h-4 w-4" />
+                  ) : (
+                    <Icon className="mr-2 h-4 w-4" />
+                  )}
+                  {t(labelKey)}
+                </Button>
+              ))}
+            </>
+          ) : (
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy || checkState.isChecking || !checkState.hasSkills}
+                onClick={() => panelRef.current?.checkUpdates()}
+              >
+                {checkState.isChecking ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                )}
+                {checkState.isChecking
+                  ? t("skills.checkingUpdates")
+                  : t("skills.checkUpdates")}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={() => panelRef.current?.openRestoreFromBackup()}
+              >
+                <History className="mr-2 h-4 w-4" />
+                {t("skills.restoreFromBackup.button")}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={() => panelRef.current?.openInstallFromZip()}
+              >
+                <FolderArchive className="mr-2 h-4 w-4" />
+                {t("skills.installFromZip.button")}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                className="relative"
+                title={hasUnmanagedSkills ? t("skills.unmanagedAvailable") : undefined}
+                onClick={() => panelRef.current?.openImport()}
+              >
+                <Download className="mr-2 h-4 w-4" />
+                {t("skills.import")}
+                {hasUnmanagedSkills && (
+                  <span
+                    className="absolute right-1 top-1 h-2 w-2 rounded-full bg-green-500"
+                    aria-hidden="true"
+                  />
+                )}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={() => panelRef.current?.openDiscovery()}
+              >
+                <Search className="mr-2 h-4 w-4" />
+                {t("skills.discover")}
+              </Button>
+            </>
+          )}
+        </div>
       </div>
 
-      {skills.length === 0 && (
-        <div className="empty-state">
-          <div className="empty-state-icon" aria-hidden="true">
-            ✦
-          </div>
-          <h3>No installed skills found</h3>
-          <p>
-            A skill is a directory containing SKILL.md in one of these
-            locations:
-          </p>
-          <div
-            style={{
-              display: "inline-block",
-              textAlign: "left",
-              fontFamily: "var(--font-mono)",
-              fontSize: 12,
-              color: "var(--color-text-muted)",
-              marginBottom: 16,
+      <div className="flex min-h-0 flex-1 flex-col">
+        {view === "manage" ? (
+          <UnifiedSkillsPanel
+            ref={panelRef}
+            currentApp="claude"
+            onOpenDiscovery={() => {
+              setSource("repos");
+              setView("discover");
             }}
-          >
-            {Object.values(SKILL_DIRS).map((d) => (
-              <div key={d}>
-                ~/{d}/&lt;name&gt;/SKILL.md
-              </div>
-            ))}
-          </div>
-          <br />
-          <button className="btn-secondary" onClick={load}>
-            Rescan
-          </button>
-        </div>
-      )}
-
-      {skills.length > 0 && matches.length === 0 && (
-        <div className="empty-state">
-          <div className="empty-state-icon" aria-hidden="true">
-            ∅
-          </div>
-          <h3>No skills match “{q.trim()}”</h3>
-          <p>Try a different skill name or agent.</p>
-          <button className="btn-secondary" onClick={() => setQ("")}>
-            Clear filter
-          </button>
-        </div>
-      )}
-
-      {needle === "" && skills.length > 0 && (
-        <div className="lib-chips">
-          {Object.entries(totals).map(([agent, n]) => (
-            <span className="chip" key={agent}>
-              {agent} <b>{n}</b>
-            </span>
-          ))}
-        </div>
-      )}
-
-      {Object.entries(byAgent).map(([agent, names]) => {
-        const limit = limits[agent] ?? PAGE_STEP;
-        const visible = names.slice(0, limit);
-        const remaining = names.length - limit;
-        const total = totals[agent] ?? names.length;
-        return (
-          <div key={agent} className="lib-group">
-            <h3 className="section-heading">
-              {agent}{" "}
-              <span
-                className="chip"
-                title={`${visible.length} shown of ${total}`}
-              >
-                {visible.length}/{total}
-              </span>
-            </h3>
-            <div className="lib-list">
-              {visible.map((n) => {
-                const rel = skillRelPath(agent, n);
-                const nameKey = `${agent}-${n}-name`;
-                const pathKey = `${agent}-${n}-path`;
-                return (
-                  <div className="lib-row compact" key={`${agent}-${n}`}>
-                    <span className="lib-name" title={rel}>
-                      {n}
-                    </span>
-                    <span
-                      className="lib-target"
-                      title={rel}
-                      style={{
-                        flex: 1,
-                        minWidth: 0,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {rel}
-                    </span>
-                    <span
-                      style={{
-                        marginLeft: "auto",
-                        display: "inline-flex",
-                        gap: 6,
-                        flexShrink: 0,
-                      }}
-                    >
-                      <button
-                        className="btn-inline"
-                        title="Copy skill name"
-                        onClick={() => copyText(nameKey, n)}
-                      >
-                        {copied === nameKey ? "Copied" : "Copy name"}
-                      </button>
-                      <button
-                        className="btn-inline"
-                        title="Copy SKILL.md path"
-                        onClick={() => copyText(pathKey, rel)}
-                      >
-                        {copied === pathKey ? "Copied" : "Copy path"}
-                      </button>
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-            {remaining > 0 && (
-              <button
-                className="btn-inline load-more"
-                onClick={() =>
-                  setLimits((m) => ({ ...m, [agent]: limit + PAGE_STEP }))
-                }
-              >
-                Show more ({remaining} remaining)
-              </button>
-            )}
-          </div>
-        );
-      })}
+            onInteractionBlockedChange={setBusy}
+            onCheckUpdatesStateChange={setCheckState}
+          />
+        ) : (
+          <SkillsPage
+            ref={pageRef}
+            initialApp="claude"
+            onSourceChange={setSource}
+          />
+        )}
+      </div>
     </div>
   );
 }

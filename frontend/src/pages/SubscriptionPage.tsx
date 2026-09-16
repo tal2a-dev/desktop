@@ -16,6 +16,130 @@ interface PricingModel {
   supported_endpoint_types?: string[];
 }
 
+/** NAPI model.Log JSON (`NAPI/model/log.go`). */
+interface UserLog {
+  id?: number;
+  model_name?: string;
+  created_at?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  quota?: number;
+  token_name?: string;
+  type?: number;
+}
+
+const LOG_TYPE_CONSUME = 2;
+
+interface WeeklyUsage {
+  start: number;
+  end: number;
+  usedUsd: number;
+  usedQuota: number;
+  requestCount: number;
+  tokenUsed: number;
+}
+
+function normalizeWeekly(raw: unknown): WeeklyUsage | null {
+  const rec = asRecord(raw);
+  if (!rec) return null;
+  const n = (v: unknown) =>
+    typeof v === "number" && Number.isFinite(v) ? v : 0;
+  return {
+    start: n(rec.start),
+    end: n(rec.end),
+    usedUsd: n(rec.usedUsd ?? rec.used_usd),
+    usedQuota: n(rec.usedQuota ?? rec.used_quota),
+    requestCount: n(rec.requestCount ?? rec.request_count),
+    tokenUsed: n(rec.tokenUsed ?? rec.token_used),
+  };
+}
+
+function errorText(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return v !== null && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : null;
+}
+
+function asNumber(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** NAPI `common.ApiSuccess` + `PageInfo`: `{ success, data: { page, page_size, total, items } }`. */
+function parseUserLogs(res: unknown): {
+  items: UserLog[];
+  total: number | null;
+  error: string | null;
+} {
+  const root = asRecord(res);
+  if (!root) {
+    return { items: [], total: null, error: "Unexpected logs response" };
+  }
+  if (root.success === false) {
+    const message =
+      typeof root.message === "string" && root.message.trim()
+        ? root.message
+        : "Couldn't load request history";
+    return { items: [], total: null, error: message };
+  }
+
+  const data = asRecord(root.data);
+  const rawItems = data?.items ?? root.items;
+  const items = Array.isArray(rawItems) ? (rawItems as UserLog[]) : [];
+  const total = asNumber(data?.total) ?? asNumber(root.total);
+
+  const consume = items.filter(
+    (row) => typeof row.type !== "number" || row.type === LOG_TYPE_CONSUME,
+  );
+  // Client-side consume filter: only trust pageInfo.total when this page
+  // did not drop non-consume rows (otherwise total includes topups/etc).
+  const dropped = items.length - consume.length;
+  return {
+    items: consume,
+    total: dropped === 0 ? total : null,
+    error: null,
+  };
+}
+
+function parseQuotaPerUnit(res: unknown): number | null {
+  const root = asRecord(res);
+  const data = asRecord(root?.data) ?? root;
+  const v = asNumber(data?.quota_per_unit);
+  return v !== null && v > 0 ? v : null;
+}
+
+function formatLogTime(ts?: number): string {
+  if (typeof ts !== "number" || ts <= 0) return "—";
+  const d = new Date(ts * 1000);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString();
+}
+
+function formatCompactCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return n.toLocaleString();
+}
+
+function formatLogQuota(raw: number | undefined, perUnit: number | null): string {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return "—";
+  if (perUnit && perUnit > 0) {
+    const usd = raw / perUnit;
+    const digits = usd >= 1 ? 2 : usd >= 0.01 ? 4 : 6;
+    return `$${usd.toFixed(digits)}`;
+  }
+  return `${raw.toLocaleString()} quota units`;
+}
+
 export function SubscriptionPage() {
   const { state } = useAuth();
   const [sub, setSub] = useState<SubscriptionInfo | null>(null);
@@ -23,6 +147,37 @@ export function SubscriptionPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modelsQ, setModelsQ] = useState("");
+  const [logs, setLogs] = useState<UserLog[]>([]);
+  const [logsTotal, setLogsTotal] = useState<number | null>(null);
+  const [logsError, setLogsError] = useState<string | null>(null);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [quotaPerUnit, setQuotaPerUnit] = useState<number | null>(null);
+  const [weekly, setWeekly] = useState<WeeklyUsage | null>(null);
+  const [weeklyError, setWeeklyError] = useState<string | null>(null);
+
+  const loadLogs = () => {
+    if (!state.authed) return;
+    setLogsLoading(true);
+    setLogsError(null);
+    invoke<unknown>("fetch_user_logs", { baseUrl: state.baseUrl })
+      .then((res) => {
+        const parsed = parseUserLogs(res);
+        if (parsed.error) {
+          setLogs([]);
+          setLogsTotal(null);
+          setLogsError(parsed.error);
+          return;
+        }
+        setLogs(parsed.items);
+        setLogsTotal(parsed.total);
+      })
+      .catch((e) => {
+        setLogs([]);
+        setLogsTotal(null);
+        setLogsError(errorText(e));
+      })
+      .finally(() => setLogsLoading(false));
+  };
 
   const load = () => {
     if (!state.authed) return;
@@ -35,8 +190,19 @@ export function SubscriptionPage() {
         setSub(info);
         setError(null);
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(errorText(e)))
       .finally(() => setLoading(false));
+    loadLogs();
+    setWeeklyError(null);
+    invoke<unknown>("fetch_weekly_usage", { baseUrl: state.baseUrl })
+      .then((res) => {
+        setWeekly(normalizeWeekly(res));
+        setWeeklyError(null);
+      })
+      .catch((e) => {
+        setWeekly(null);
+        setWeeklyError(errorText(e));
+      });
   };
 
   useEffect(() => {
@@ -49,6 +215,9 @@ export function SubscriptionPage() {
     invoke<{ data: PricingModel[] }>("get_pricing", { baseUrl: state.baseUrl })
       .then((res) => setModels(Array.isArray(res?.data) ? res.data : []))
       .catch(() => setModels([]));
+    invoke<unknown>("get_status", { baseUrl: state.baseUrl })
+      .then((res) => setQuotaPerUnit(parseQuotaPerUnit(res)))
+      .catch(() => setQuotaPerUnit(null));
   }, [state.authed, state.baseUrl]);
 
   // Publish quota for the shell header mini-meter + 28px statusline.
@@ -168,8 +337,61 @@ export function SubscriptionPage() {
       )
     : models;
 
+  const hasTotal = logsTotal !== null;
+  const reqCount = hasTotal ? logsTotal : logs.length;
+  const reqLabel = hasTotal
+    ? "All requests"
+    : logs.length > 0
+      ? "Last 50 requests"
+      : "Requests";
+  const tokenCount = logs.reduce(
+    (n, r) => n + (r.prompt_tokens ?? 0) + (r.completion_tokens ?? 0),
+    0,
+  );
+  const tokenLabel =
+    !hasTotal || (logsTotal !== null && logsTotal > logs.length)
+      ? "Tokens (this page)"
+      : "Tokens";
+
   return (
     <div>
+      <div className="mb-4 rounded-xl border border-border p-4">
+        <p className="text-xs text-muted-foreground">This week</p>
+        {weeklyError ? (
+          <p className="mt-1 text-sm text-red-400">{weeklyError}</p>
+        ) : weekly ? (
+          <>
+            <p className="text-2xl font-semibold">
+              ${weekly.usedUsd.toFixed(2)}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {formatCompactCount(weekly.requestCount)} requests ·{" "}
+              {formatCompactCount(weekly.tokenUsed)} tokens · last 7 days
+              from NAPI quota_data
+            </p>
+          </>
+        ) : (
+          <p className="mt-1 text-sm text-muted-foreground">Loading week…</p>
+        )}
+      </div>
+      <div className="mb-4 grid grid-cols-2 gap-3">
+        <div className="rounded-xl border border-border p-4">
+          <p className="text-xs text-muted-foreground">{reqLabel}</p>
+          <p className="text-2xl font-semibold">
+            {logsLoading && logs.length === 0 && !logsError
+              ? "…"
+              : formatCompactCount(reqCount)}
+          </p>
+        </div>
+        <div className="rounded-xl border border-border p-4">
+          <p className="text-xs text-muted-foreground">{tokenLabel}</p>
+          <p className="text-2xl font-semibold">
+            {logsLoading && logs.length === 0 && !logsError
+              ? "…"
+              : formatCompactCount(tokenCount)}
+          </p>
+        </div>
+      </div>
       <div className="page-head">
         <div>
           <h2>Subscription</h2>
@@ -229,6 +451,65 @@ export function SubscriptionPage() {
               ? "Quota exhausted — upgrade to continue."
               : "High usage — over 80% of quota used."}
           </p>
+        )}
+      </div>
+
+      <div className="mb-6">
+        <h3 className="section-heading">Recent requests</h3>
+        {logsError ? (
+          <div>
+            <div className="error-banner" role="alert">
+              {logsError}
+            </div>
+            <button
+              className="btn-secondary"
+              onClick={loadLogs}
+              style={{ marginTop: 12 }}
+            >
+              Retry history
+            </button>
+          </div>
+        ) : logsLoading && logs.length === 0 ? (
+          <div className="skeleton-list" aria-hidden="true">
+            <div className="skeleton" style={{ height: 44 }} />
+            <div className="skeleton" style={{ height: 44 }} />
+            <div className="skeleton" style={{ height: 44 }} />
+          </div>
+        ) : logs.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-state-icon" aria-hidden="true">
+              ○
+            </div>
+            <h3>No requests yet</h3>
+            <p>Consume logs from this account will show up here.</p>
+          </div>
+        ) : (
+          <div className="divide-y divide-border rounded-xl border border-border">
+            {logs.map((r, i) => {
+              const tokens =
+                (r.prompt_tokens ?? 0) + (r.completion_tokens ?? 0);
+              return (
+                <div
+                  key={r.id ?? i}
+                  className="flex items-center justify-between gap-3 px-3 py-2 text-sm"
+                >
+                  <div className="min-w-0">
+                    <div className="font-mono text-xs truncate">
+                      {r.model_name ?? "model"}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {formatLogTime(r.created_at)}
+                      {r.token_name ? ` · ${r.token_name}` : ""}
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-right text-xs text-muted-foreground">
+                    <div>{tokens.toLocaleString()} tok</div>
+                    <div>{formatLogQuota(r.quota, quotaPerUnit)}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
 

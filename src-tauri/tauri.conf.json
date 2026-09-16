@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
-  "productName": "Napi Desktop",
+  "productName": "tal2a",
   "version": "0.1.0",
   "identifier": "org.mikawi.napi-desktop",
   "build": {
@@ -13,7 +13,8 @@
     "withGlobalTauri": false,
     "windows": [
       {
-        "title": "Napi Desktop",
+        "label": "main",
+        "title": "tal2a",
         "width": 800,
         "height": 600,
         "resizable": true,
@@ -27,12 +28,24 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRFQ0JDMUFCQTc1RTVEODAKUldTQVhWNm5xOEhMVGprSHZGMGtzR2x2UUNMSW1xTUdLQnV5SVpFcnNacitkN0Y4WnJpZElxQUkK",
+      "endpoints": [
+        "https://github.com/api-tal2a/desktop/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

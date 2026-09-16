@@ -1,4 +1,4 @@
-# NAPI Desktop
+# tal2a
 
 A desktop control panel for the [NAPI](https://napi.mikawi.org) AI gateway. It finds the
 coding agents already installed on your machine, points them at NAPI in one click, launches
@@ -47,11 +47,27 @@ bun install
 bun run tauri dev
 ```
 
+This repo often lives on ExFAT (`nvm_500`). macOS writes AppleDouble `._*` sidecars there; Tauri's build script then panics on `._default.toml` (not UTF-8). `bun run tauri` forces `CARGO_TARGET_DIR` onto APFS at `~/.cache/napi-desktop/target`. Override with `NAPI_CARGO_TARGET_DIR` if needed.
+
 For a release build:
 
 ```bash
 bun run tauri build
 ```
+
+## Releases and auto-update
+
+Every push to `main` runs `.github/workflows/release.yml`:
+
+| Platform | Artifact |
+| --- | --- |
+| macOS | universal `.dmg` / `.app` (Apple Silicon + Intel) |
+| Windows | `.msi` / `.exe` |
+| Linux | `.AppImage` / `.deb` |
+
+The app checks `https://github.com/api-tal2a/desktop/releases/latest/download/latest.json` and can install from Settings → About.
+
+First release needs the updater signing secret — see `.github/SECRETS.md`.
 
 ---
 
