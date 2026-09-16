@@ -39,7 +39,7 @@ agent's config.
 ## Quick start
 
 ```bash
-git clone https://github.com/api-tal2a/desktop.git
+git clone https://github.com/tal2a-dev/desktop.git
 cd desktop
 
 bun install
@@ -65,7 +65,7 @@ Every push to `main` runs `.github/workflows/release.yml`:
 | Windows | `.msi` / `.exe` |
 | Linux | `.AppImage` / `.deb` |
 
-The app checks `https://github.com/api-tal2a/desktop/releases/latest/download/latest.json` and can install from Settings → About.
+The app checks `https://github.com/tal2a-dev/desktop/releases/latest/download/latest.json` and can install from Settings → About.
 
 First release needs the updater signing secret — see `.github/SECRETS.md`.
 

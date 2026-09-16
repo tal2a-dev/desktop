@@ -44,7 +44,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRFQ0JDMUFCQTc1RTVEODAKUldTQVhWNm5xOEhMVGprSHZGMGtzR2x2UUNMSW1xTUdLQnV5SVpFcnNacitkN0Y4WnJpZElxQUkK",
       "endpoints": [
-        "https://github.com/api-tal2a/desktop/releases/latest/download/latest.json"
+        "https://github.com/tal2a-dev/desktop/releases/latest/download/latest.json"
       ]
     }
   }

@@ -12,6 +12,9 @@ concurrency:
   group: release-main
   cancel-in-progress: true
 
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+
 jobs:
   publish:
     strategy:

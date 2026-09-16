@@ -1,6 +1,6 @@
 # Release secrets
 
-The updater will not ship until these GitHub Actions secrets exist on `api-tal2a/desktop`.
+The updater will not ship until these GitHub Actions secrets exist on `tal2a-dev/desktop`.
 
 | Secret | Value |
 | --- | --- |
@@ -8,7 +8,7 @@ The updater will not ship until these GitHub Actions secrets exist on `api-tal2a
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Only if the key was generated with a password. Empty is fine. |
 
 ```bash
-gh secret set TAURI_SIGNING_PRIVATE_KEY --repo api-tal2a/desktop < .tauri/tal2a.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY --repo tal2a-dev/desktop < .tauri/tal2a.key
 ```
 
 Optional Apple notarization (unsigned macOS builds still download; Gatekeeper needs right-click → Open):

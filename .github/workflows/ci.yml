@@ -9,6 +9,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+
 jobs:
   frontend:
     runs-on: ubuntu-22.04
