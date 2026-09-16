@@ -62,11 +62,7 @@ pub(crate) fn home_dir() -> PathBuf {
 /// survive restarts. Falls back to the built-in default.
 fn napi_host() -> Option<String> {
     let raw = std::fs::read_to_string(base_url_path()).unwrap_or_default();
-    let url = if raw.trim().is_empty() {
-        DEFAULT_BASE_URL.to_string()
-    } else {
-        raw.trim().to_string()
-    };
+    let url = canonicalize_base_url(raw.trim());
     url.trim_start_matches("https://")
         .trim_start_matches("http://")
         .split('/')
@@ -75,7 +71,16 @@ fn napi_host() -> Option<String> {
         .map(str::to_string)
 }
 
-const DEFAULT_BASE_URL: &str = "https://napi.mikawi.org";
+const DEFAULT_BASE_URL: &str = "https://tal2a.app";
+
+fn canonicalize_base_url(url: &str) -> String {
+    let t = url.trim();
+    if t.is_empty() || t.contains("napi.mikawi.org") {
+        DEFAULT_BASE_URL.to_string()
+    } else {
+        t.to_string()
+    }
+}
 
 fn base_url_path() -> PathBuf {
     dirs::config_dir()
@@ -85,12 +90,13 @@ fn base_url_path() -> PathBuf {
 }
 
 pub fn set_base_url(url: &str) -> Result<(), String> {
-    validate_base_url(url)?;
+    let url = canonicalize_base_url(url);
+    validate_base_url(&url)?;
     let path = base_url_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    atomic_write(&path, url.trim().as_bytes())
+    atomic_write(&path, url.as_bytes())
 }
 
 pub(crate) fn atomic_write(path: &std::path::Path, content: &[u8]) -> Result<(), String> {

@@ -229,6 +229,7 @@ html,
 body,
 #root {
   height: 100%;
+  min-height: 100dvh;
 }
 
 .napi {
@@ -411,19 +412,37 @@ body,
 }
 
 .login-container {
-  @apply flex min-h-full items-center justify-center p-6;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 100dvh;
+  padding: max(16px, env(safe-area-inset-top))
+    max(16px, env(safe-area-inset-right))
+    max(16px, env(safe-area-inset-bottom))
+    max(16px, env(safe-area-inset-left));
 }
 
 .login-card {
-  @apply w-full max-w-sm rounded-xl p-6;
+  width: min(24rem, 100%);
+  margin-inline: auto;
+  overflow-y: auto;
+  border-radius: 0.75rem;
+  padding: 1.5rem;
+}
+
+@media (max-width: 420px) {
+  .login-card {
+    padding: 1rem;
+  }
 }
 
 .login-card h1 {
-  @apply text-xl font-semibold;
+  @apply text-center text-xl font-semibold;
 }
 
 .subtitle {
-  @apply mb-4 text-sm text-muted-foreground;
+  @apply mb-4 text-center text-sm text-muted-foreground;
 }
 
 .field {
@@ -452,6 +471,11 @@ body,
 
 .oauth-divider {
   @apply my-3 text-center text-xs text-muted-foreground;
+}
+
+.input-otp {
+  text-align: center;
+  letter-spacing: 0.35em;
 }
 
 .quota-bar-container {

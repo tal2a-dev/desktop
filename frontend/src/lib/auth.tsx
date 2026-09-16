@@ -24,13 +24,24 @@ type AuthAction =
   | { type: "RESTORED"; authed: boolean }
   | { type: "SET_BASE_URL"; url: string };
 
-const BASE_URL_DEFAULT = "https://napi.mikawi.org";
+const BASE_URL_DEFAULT = "https://tal2a.app";
 
 const BASE_URL_KEY = "napi:base-url";
 
+function canonicalizeBaseUrl(url: string): string {
+  const t = url.trim();
+  if (!t || t.includes("napi.mikawi.org")) return BASE_URL_DEFAULT;
+  return t;
+}
+
 function readBaseUrl(): string {
   try {
-    return localStorage.getItem(BASE_URL_KEY) || BASE_URL_DEFAULT;
+    const stored = localStorage.getItem(BASE_URL_KEY) || "";
+    const next = canonicalizeBaseUrl(stored);
+    if (stored && stored !== next) {
+      localStorage.setItem(BASE_URL_KEY, next);
+    }
+    return next;
   } catch {
     return BASE_URL_DEFAULT;
   }
@@ -150,13 +161,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
   const setBaseUrl = (url: string) => {
+    const next = canonicalizeBaseUrl(url);
     try {
-      localStorage.setItem(BASE_URL_KEY, url);
+      localStorage.setItem(BASE_URL_KEY, next);
     } catch {
       // localStorage unavailable — session-only
     }
-    invoke("save_base_url", { baseUrl: url }).catch(() => {});
-    dispatch({ type: "SET_BASE_URL", url });
+    invoke("save_base_url", { baseUrl: next }).catch(() => {});
+    dispatch({ type: "SET_BASE_URL", url: next });
   };
 
   // ponytail: github_oauth blocks on a loopback callback, then returns the same

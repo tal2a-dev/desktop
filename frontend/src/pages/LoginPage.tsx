@@ -1,5 +1,4 @@
 import { useState, type FormEvent } from "react";
-import { BrandLockup } from "../components/BrandLockup.tsx";
 import { useAuth } from "../lib/auth.tsx";
 import { IS_DEMO } from "../lib/tauri.ts";
 
@@ -135,7 +134,7 @@ export function LoginPage() {
     return (
       <div className="login-container">
         <form onSubmit={handleVerify} className="login-card glass-card">
-          <BrandLockup className="mb-2" heightClass="h-10" />
+          <h1>Sign in</h1>
           <p className="subtitle">Two-factor authentication required</p>
           <div className="field">
             <label className="field-label" htmlFor="code">
@@ -221,7 +220,7 @@ export function LoginPage() {
   return (
     <div className="login-container">
       <form onSubmit={handleLogin} className="login-card glass-card">
-        <BrandLockup className="mb-2" heightClass="h-10" />
+        <h1>Sign in</h1>
         <p className="subtitle">Sign in to your account</p>
         {IS_DEMO && (
           <div className="error-banner" role="note" style={{ marginBottom: 16 }}>

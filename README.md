@@ -77,7 +77,7 @@ There is none, and nothing is baked into the binary:
 
 | Value                      | Where it comes from                                                 |
 | -------------------------- | ------------------------------------------------------------------- |
-| Gateway base URL           | Defaults to `https://napi.mikawi.org`, editable in the app          |
+| Gateway base URL           | Defaults to `https://tal2a.app`, editable in the app                |
 | GitHub OAuth client ID     | Read at runtime from the gateway's `/api/status`                    |
 | GitHub OAuth client secret | Never reaches this app — the gateway holds it and runs the exchange |
 

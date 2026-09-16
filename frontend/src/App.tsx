@@ -393,7 +393,7 @@ function AppContent() {
 
   if (!state.authed) {
     return (
-      <div className="flex h-screen items-center justify-center bg-background">
+      <div className="min-h-dvh w-full overflow-y-auto bg-background">
         <LoginPage />
       </div>
     );
