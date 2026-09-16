@@ -262,31 +262,171 @@ fn apply_claude_plugin() -> Result<(), String> {
     write_json(&path, &v)
 }
 
+/// ChatGPT Desktop signed-out picker allowlist (codex-router `native-alias.mjs`).
+/// We only publish a native slug when live `GET /v1/models` includes that id —
+/// tal2a has no rewrite proxy, so a stolen slug would 404 on the gateway.
+const CODEX_NATIVE_PICKER_SLUGS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5.2",
+];
+
+fn codex_reasoning_levels() -> Value {
+    // low..xhigh is the vocabulary every Codex build since ~0.13 deserializes.
+    // `max`/`ultra` exist only on CLI ≥ 0.143 and reject older catalogs.
+    json!([
+        { "effort": "low", "description": "Fast" },
+        { "effort": "medium", "description": "Balanced" },
+        { "effort": "high", "description": "Deep" },
+        { "effort": "xhigh", "description": "Extra high" }
+    ])
+}
+
+fn codex_catalog_entry(slug: &str, display: &str, priority: u32, visibility: &str) -> Value {
+    json!({
+        "slug": slug,
+        "display_name": display,
+        "description": format!("{display} via tal2a"),
+        "priority": priority,
+        "visibility": visibility,
+        "supported_in_api": true,
+        "base_instructions": format!(
+            "You are Codex, a coding agent using {display} through tal2a."
+        ),
+        "model_messages": {
+            "instructions_template": format!(
+                "You are Codex, a coding agent using {display} through tal2a. {{{{ personality }}}}"
+            ),
+            "instructions_variables": { "personality_default": "" }
+        },
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": codex_reasoning_levels(),
+        "context_window": 272000,
+        "max_context_window": 272000,
+        "effective_context_window_percent": 95,
+        "auto_compact_token_limit": 220000,
+        "input_modalities": ["text"],
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "default_service_tier": null,
+        "availability_nux": null,
+        "upgrade": null,
+        "supports_reasoning_summaries": false,
+        "default_reasoning_summary": "none",
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "supports_search_tool": false,
+        "supports_image_detail_original": false,
+        "supports_parallel_tool_calls": false,
+        "prefer_websockets": false,
+        "use_responses_lite": false,
+        "apply_patch_tool_type": "freeform",
+        "multi_agent_version": "v1",
+        "shell_type": "unified_exec",
+        "truncation_policy": { "mode": "bytes", "limit": 10000 },
+        "experimental_supported_tools": []
+    })
+}
+
+/// Live NAPI catalog in the Codex App picker schema (codex-router `routedModel`).
+/// Native GPT slugs are listed only when the gateway actually serves that id.
+fn build_codex_catalog(ids: &[String]) -> (Value, Option<String>) {
+    let idset: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut models = Vec::new();
+    let mut priority = 1u32;
+    let mut added = std::collections::HashSet::new();
+    for slug in CODEX_NATIVE_PICKER_SLUGS {
+        if idset.contains(slug) && added.insert(*slug) {
+            models.push(codex_catalog_entry(slug, slug, priority, "list"));
+            priority += 1;
+        }
+    }
+    for id in ids {
+        if added.insert(id.as_str()) {
+            models.push(codex_catalog_entry(id, id, priority, "list"));
+            priority += 1;
+        }
+    }
+    let default_model = models
+        .first()
+        .and_then(|m| m.get("slug"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (json!({ "models": models }), default_model)
+}
+
+fn point_codex_profiles_at_napi(doc: &mut toml_edit::DocumentMut) {
+    let Some(profiles) = doc.get_mut("profiles").and_then(|item| item.as_table_mut()) else {
+        return;
+    };
+    for (_, item) in profiles.iter_mut() {
+        let Some(tbl) = item.as_table_mut() else {
+            continue;
+        };
+        match tbl.get("model_provider").and_then(|v| v.as_str()) {
+            Some("openai") | None => {
+                tbl["model_provider"] = toml_edit::value("napi");
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Codex CLI, Codex Desktop, and local ChatGPT Work all read `CODEX_HOME`
-/// (`~/.codex`). Provider `base_url` must include `/v1` (Codex appends
-/// `/responses`). An inline `model_providers = {}` cannot hold a nested
-/// table — convert it to a dotted `[model_providers.napi]` table.
-fn apply_codex_toml(existing: &str, api_key: &str, base_url: &str) -> String {
+/// (`~/.codex`). This is login-free overwrite (codex-router `auth-mode on`):
+/// custom provider `napi`, `requires_openai_auth = false`, `openai_base_url`
+/// + `model_catalog_json` so the App picker loads live tal2a models with
+/// reasoning modes. Provider `base_url` must include `/v1` (Codex appends
+/// `/responses`). Never write `[model_providers.openai]` — Desktop rejects it.
+/// An inline `model_providers = {}` cannot hold a nested table — convert it
+/// to a dotted `[model_providers.napi]` table.
+fn apply_codex_toml(
+    existing: &str,
+    api_key: &str,
+    base_url: &str,
+    catalog_path: Option<&Path>,
+    default_model: Option<&str>,
+) -> String {
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_else(|_| toml_edit::DocumentMut::new());
     let v1 = openai_compat_v1(base_url);
     doc["openai_base_url"] = toml_edit::value(v1.as_str());
     doc["model_provider"] = toml_edit::value("napi");
+    if let Some(path) = catalog_path {
+        doc["model_catalog_json"] = toml_edit::value(path.to_string_lossy().as_ref());
+    } else if doc
+        .get("model_catalog_json")
+        .and_then(|item| item.as_str())
+        .is_some_and(|p| p.contains("tal2a-models.json"))
+    {
+        doc.remove("model_catalog_json");
+    }
+    if let Some(model) = default_model {
+        let current = doc.get("model").and_then(|item| item.as_str()).unwrap_or("");
+        if current.is_empty() {
+            doc["model"] = toml_edit::value(model);
+        }
+    }
 
     let mut providers = toml_edit::Table::new();
     providers.set_implicit(true);
     match doc.remove("model_providers") {
         Some(toml_edit::Item::Table(tbl)) => {
             for (k, v) in tbl {
-                if k.as_str() != "napi" && !item_points_at_9router(&v) {
+                if k.as_str() != "napi" && k.as_str() != "openai" && !item_points_at_9router(&v) {
                     providers.insert(&k, v);
                 }
             }
         }
         Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(inline))) => {
             for (k, v) in inline.iter() {
-                if k != "napi" && !value_points_at_9router(v) {
+                if k != "napi" && k != "openai" && !value_points_at_9router(v) {
                     providers.insert(k, toml_edit::Item::Value(v.clone()));
                 }
             }
@@ -296,7 +436,7 @@ fn apply_codex_toml(existing: &str, api_key: &str, base_url: &str) -> String {
 
     let mut napi = toml_edit::Table::new();
     napi.set_implicit(false);
-    napi["name"] = toml_edit::value("NAPI");
+    napi["name"] = toml_edit::value("tal2a");
     napi["base_url"] = toml_edit::value(v1.as_str());
     napi["wire_api"] = toml_edit::value("responses");
     napi["env_key"] = toml_edit::value("OPENAI_API_KEY");
@@ -315,6 +455,7 @@ fn apply_codex_toml(existing: &str, api_key: &str, base_url: &str) -> String {
         env["OPENAI_BASE_URL"] = toml_edit::value(v1.as_str());
         doc["env"] = toml_edit::Item::Table(env);
     }
+    point_codex_profiles_at_napi(&mut doc);
     doc.to_string()
 }
 
@@ -322,8 +463,27 @@ fn write_codex(api_key: &str, base_url: &str) -> Result<(), String> {
     let dir = config_dir_for("codex");
     let path = dir.join("config.toml");
     ensure_parent(&path)?;
+    let catalog_path = dir.join("tal2a-models.json");
+    let ids = fetch_v1_model_ids_blocking(base_url, api_key).unwrap_or_default();
+    let (catalog, default_model) = build_codex_catalog(&ids);
+    let catalog_arg = if catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| !rows.is_empty())
+    {
+        write_json(&catalog_path, &catalog)?;
+        Some(catalog_path.as_path())
+    } else {
+        None
+    };
     let content = fs::read_to_string(&path).unwrap_or_default();
-    let next = apply_codex_toml(&content, api_key, base_url);
+    let next = apply_codex_toml(
+        &content,
+        api_key,
+        base_url,
+        catalog_arg,
+        default_model.as_deref(),
+    );
     atomic_write(&path, next.as_bytes())?;
 
     let v1 = openai_compat_v1(base_url);
@@ -635,7 +795,16 @@ async fn fetch_v1_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>
 }
 
 fn fetch_v1_model_ids_blocking(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
-    tauri::async_runtime::block_on(fetch_v1_model_ids(base_url, api_key))
+    // write_agent is sync but called from async Tauri commands (auto_setup).
+    // Nested block_on panics: "Cannot start a runtime from within a runtime."
+    let base_url = base_url.to_string();
+    let api_key = api_key.to_string();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(fetch_v1_model_ids(&base_url, &api_key))
+        }),
+        Err(_) => tauri::async_runtime::block_on(fetch_v1_model_ids(&base_url, &api_key)),
+    }
 }
 
 fn write_claude_desktop_deployment_mode(path: &Path) -> Result<(), String> {
@@ -1047,7 +1216,7 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
 
 fn looks_like_napi(value: &str) -> bool {
     let v = value.to_ascii_lowercase();
-    v.contains("napi.mikawi.org") || v.contains("napi-desktop")
+    v.contains("tal2a.app") || v.contains("napi.mikawi.org") || v.contains("napi-desktop")
 }
 
 fn strip_json_env_keys(path: &Path, keys: &[&str]) -> Result<bool, String> {
@@ -1132,6 +1301,13 @@ fn clear_codex_napi() -> Result<String, String> {
             {
                 doc.remove("openai_base_url");
             }
+            if doc
+                .get("model_catalog_json")
+                .and_then(|item| item.as_str())
+                .is_some_and(|p| p.contains("tal2a-models.json"))
+            {
+                doc.remove("model_catalog_json");
+            }
             if let Some(env) = doc.get_mut("env").and_then(|item| item.as_table_mut()) {
                 for key in ["OPENAI_API_KEY", "OPENAI_BASE_URL"] {
                     let drop = env
@@ -1144,6 +1320,16 @@ fn clear_codex_napi() -> Result<String, String> {
                     }
                 }
             }
+            if let Some(profiles) = doc.get_mut("profiles").and_then(|item| item.as_table_mut()) {
+                for (_, item) in profiles.iter_mut() {
+                    let Some(tbl) = item.as_table_mut() else {
+                        continue;
+                    };
+                    if tbl.get("model_provider").and_then(|v| v.as_str()) == Some("napi") {
+                        tbl.remove("model_provider");
+                    }
+                }
+            }
             atomic_write(&path, doc.to_string().as_bytes())?;
         }
     }
@@ -1151,6 +1337,7 @@ fn clear_codex_napi() -> Result<String, String> {
         &dir.join(".env"),
         &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
     );
+    let _ = delete_file(&dir.join("tal2a-models.json"));
     let auth = dir.join("auth.json");
     if auth.is_file() {
         let v = load_json(&auth);
@@ -1435,6 +1622,7 @@ mod tests {
 
     #[test]
     fn looks_like_napi_host() {
+        assert!(looks_like_napi("https://tal2a.app/v1"));
         assert!(looks_like_napi("https://napi.mikawi.org/v1"));
         assert!(!looks_like_napi("https://api.openai.com"));
     }
@@ -1496,7 +1684,7 @@ mod tests {
     #[test]
     fn apply_codex_toml_replaces_inline_empty_table() {
         let existing = "openai_base_url = \"https://napi.mikawi.org\"\nmodel_provider = \"napi\"\nmodel_providers = {}\n";
-        let out = apply_codex_toml(existing, "sk-test", "https://napi.mikawi.org");
+        let out = apply_codex_toml(existing, "sk-test", "https://napi.mikawi.org", None, None);
         assert!(
             out.contains("[model_providers.napi]"),
             "expected dotted napi table, got:\n{out}"
@@ -1515,7 +1703,13 @@ mod tests {
 name = "local"
 base_url = "http://127.0.0.1:4000/v1"
 "#;
-        let out = apply_codex_toml(existing, "sk-test", "https://napi.mikawi.org/v1");
+        let out = apply_codex_toml(
+            existing,
+            "sk-test",
+            "https://napi.mikawi.org/v1",
+            None,
+            None,
+        );
         assert!(out.contains("[model_providers.local]"), "got:\n{out}");
         assert!(out.contains("[model_providers.napi]"), "got:\n{out}");
         assert!(out.contains("http://127.0.0.1:4000/v1"));
@@ -1528,12 +1722,91 @@ base_url = "http://127.0.0.1:4000/v1"
 name = "other"
 base_url = "https://9router.mikawi.org/v1"
 "#;
-        let out = apply_codex_toml(existing, "sk-test", "https://napi.mikawi.org");
+        let out = apply_codex_toml(existing, "sk-test", "https://napi.mikawi.org", None, None);
         assert!(
             !out.contains("9router.mikawi.org"),
             "9router must not survive a NAPI overwrite:\n{out}"
         );
         assert!(out.contains("[model_providers.napi]"));
+    }
+
+    #[test]
+    fn apply_codex_toml_writes_catalog_and_preserves_profiles() {
+        let existing = r#"
+model_reasoning_effort = "xhigh"
+
+[profiles.work]
+model = "gpt-5.6-terra"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+"#;
+        let catalog = PathBuf::from("/tmp/tal2a-models.json");
+        let out = apply_codex_toml(
+            existing,
+            "sk-test",
+            "https://tal2a.app",
+            Some(&catalog),
+            Some("gpt-5.6-sol"),
+        );
+        assert!(out.contains("model_catalog_json = \"/tmp/tal2a-models.json\""), "got:\n{out}");
+        assert!(out.contains("model = \"gpt-5.6-sol\""), "got:\n{out}");
+        assert!(out.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(out.contains("[profiles.work]"));
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(out.contains("sandbox_mode = \"workspace-write\""));
+        assert!(
+            out.contains("model = \"gpt-5.6-terra\""),
+            "profile model must stay: {out}"
+        );
+        let work = out.split("[profiles.work]").nth(1).unwrap_or("");
+        assert!(
+            work.contains("model_provider = \"napi\""),
+            "profile must be remapped to napi:\n{work}"
+        );
+        assert!(out.contains("requires_openai_auth = false"));
+        assert!(out.contains("name = \"tal2a\""));
+        assert!(!out.contains("[model_providers.openai]"));
+    }
+
+    #[test]
+    fn build_codex_catalog_aliases_only_live_native_slugs() {
+        let ids = vec![
+            "gpt-5.6-sol".into(),
+            "grok-4".into(),
+            "gpt-5.4-mini".into(),
+        ];
+        let (catalog, default_model) = build_codex_catalog(&ids);
+        let models = catalog["models"].as_array().expect("models");
+        let slugs: Vec<&str> = models
+            .iter()
+            .filter_map(|m| m["slug"].as_str())
+            .collect();
+        assert_eq!(slugs[0], "gpt-5.6-sol");
+        assert_eq!(slugs[1], "gpt-5.4-mini");
+        assert!(slugs.contains(&"grok-4"));
+        assert!(!slugs.contains(&"gpt-5.6-luna"), "must not steal a native slug NAPI does not serve");
+        assert_eq!(default_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(models[0]["default_reasoning_level"], "high");
+        let efforts: Vec<&str> = models[0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["effort"].as_str())
+            .collect();
+        assert_eq!(efforts, ["low", "medium", "high", "xhigh"]);
+        assert_eq!(models[0]["visibility"], "list");
+        assert_eq!(models[0]["shell_type"], "unified_exec");
+        assert_eq!(models[0]["truncation_policy"]["mode"], "bytes");
+        assert!(models[0]["experimental_supported_tools"].as_array().unwrap().is_empty());
+        assert!(models[0]["base_instructions"].as_str().unwrap().contains("tal2a"));
+        assert!(models[0]["model_messages"]["instructions_template"].is_string());
+    }
+
+    #[test]
+    fn build_codex_catalog_empty_has_no_default() {
+        let (catalog, default_model) = build_codex_catalog(&[]);
+        assert!(catalog["models"].as_array().unwrap().is_empty());
+        assert!(default_model.is_none());
     }
 
     #[test]
