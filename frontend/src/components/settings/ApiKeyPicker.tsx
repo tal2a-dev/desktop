@@ -78,7 +78,7 @@ export function ApiKeyPicker() {
         prev.map((k) => ({ ...k, selected: k.id === picked.id })),
       );
       toast.success(
-        `${picked.name} is the key NAPI Desktop will write on Overwrite`,
+        `${picked.name} selected and wrote to all agents`,
       );
     } catch (e) {
       toast.error(String(e));

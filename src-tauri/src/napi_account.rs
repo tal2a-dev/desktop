@@ -152,6 +152,9 @@ pub async fn select_token(base_url: &str, token_id: i64) -> Result<ApiKeyInfo, S
     let mut settings = agent_write::load_app_settings();
     settings.selected_token_id = Some(token_id);
     agent_write::save_app_settings(&settings)?;
+    // Picking a key must also put it into every agent config immediately.
+    // Otherwise the keychain and the files disagree until a manual Apply.
+    let _ = agent_write::write_all_agents(&raw, base_url);
     let keys = list_tokens(base_url).await?;
     keys.into_iter()
         .find(|k| k.id == token_id)

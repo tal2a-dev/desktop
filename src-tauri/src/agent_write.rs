@@ -971,11 +971,14 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
             upsert_json_env(
                 &path,
                 &[
-                    ("ANTHROPIC_API_KEY", api_key),
                     ("ANTHROPIC_BASE_URL", origin.as_str()),
                     ("ANTHROPIC_AUTH_TOKEN", api_key),
                 ],
             )?;
+            // Legacy overwrites wrote ANTHROPIC_API_KEY alongside the token,
+            // which trips Claude Code's auth-conflict warning. The correct
+            // shape is BASE_URL + AUTH_TOKEN only, so drop any stale key.
+            let _ = strip_json_env_keys(&path, &["ANTHROPIC_API_KEY"]);
             if settings.enable_claude_plugin_integration {
                 let _ = apply_claude_plugin();
             }
@@ -1643,6 +1646,41 @@ mod tests {
         strip_json_env_keys(&path, &["ANTHROPIC_API_KEY"]).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(v["env"]["KEEP"], "yes");
+        assert_eq!(v["other"], 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_code_env_is_base_url_plus_auth_token_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "napi-claude-env-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        // Legacy file already poisoned with the old third key.
+        fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_API_KEY":"sk-old","KEEP":"yes"},"other":1}"#,
+        )
+        .unwrap();
+        // Same transform as write_agent("claude"): upsert the two correct
+        // keys, then drop the legacy API_KEY that causes auth conflicts.
+        upsert_json_env(
+            &path,
+            &[
+                ("ANTHROPIC_BASE_URL", "https://tal2a.app"),
+                ("ANTHROPIC_AUTH_TOKEN", "sk-new"),
+            ],
+        )
+        .unwrap();
+        strip_json_env_keys(&path, &["ANTHROPIC_API_KEY"]).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "https://tal2a.app");
+        assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-new");
         assert!(v["env"].get("ANTHROPIC_API_KEY").is_none());
         assert_eq!(v["env"]["KEEP"], "yes");
         assert_eq!(v["other"], 1);

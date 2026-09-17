@@ -249,7 +249,7 @@ fn scan_agents() -> Vec<AgentConfig> {
             "Claude Code",
             "Claude Code pointed at NAPI",
             agent_write::config_dir_for("claude").join("settings.json"),
-            "env.ANTHROPIC_API_KEY",
+            "env.ANTHROPIC_AUTH_TOKEN",
             "env.ANTHROPIC_BASE_URL",
             "json",
             "claude",
@@ -1626,8 +1626,9 @@ mod tests {
         // ponytail: reconfigure_agent reads ~/.claude/settings.json via home_dir();
         // to test without touching the real home we exercise the JSON transform
         // shape it produces on a sample settings document instead.
+        // Claude Code uses BASE_URL + AUTH_TOKEN only; API_KEY must not be written.
         let mut v: serde_json::Value = serde_json::from_str(
-            r#"{"permissions": {"allow": ["Bash"]}, "env": {"ANTHROPIC_API_KEY": "old"}}"#,
+            r#"{"permissions": {"allow": ["Bash"]}, "env": {"ANTHROPIC_AUTH_TOKEN": "old"}}"#,
         )
         .unwrap();
         let env = v
@@ -1635,14 +1636,15 @@ mod tests {
             .unwrap()
             .entry("env")
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        env["ANTHROPIC_API_KEY"] = serde_json::Value::String("sk-new".into());
+        env["ANTHROPIC_AUTH_TOKEN"] = serde_json::Value::String("sk-new".into());
         env["ANTHROPIC_BASE_URL"] =
             serde_json::Value::String("https://napi.mikawi.org".into());
         // Round-trip: serialize, re-parse, assert fields changed and the rest intact.
         let out = serde_json::to_string(&v).unwrap();
         let back: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(back["env"]["ANTHROPIC_API_KEY"], "sk-new");
+        assert_eq!(back["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-new");
         assert_eq!(back["env"]["ANTHROPIC_BASE_URL"], "https://napi.mikawi.org");
+        assert!(back["env"].get("ANTHROPIC_API_KEY").is_none());
         assert_eq!(back["permissions"]["allow"][0], "Bash");
     }
 
