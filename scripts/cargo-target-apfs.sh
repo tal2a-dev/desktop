@@ -6,7 +6,7 @@
 # CI already has a real target dir — do not override CARGO_TARGET_DIR if set.
 set -euo pipefail
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-  export CARGO_TARGET_DIR="${NAPI_CARGO_TARGET_DIR:-${HOME}/.cache/napi-desktop/target}"
+  export CARGO_TARGET_DIR="${TAL2A_CARGO_TARGET_DIR:-${NAPI_CARGO_TARGET_DIR:-${HOME}/.cache/tal2a/target}}"
 fi
 mkdir -p "${CARGO_TARGET_DIR}"
 exec "$@"

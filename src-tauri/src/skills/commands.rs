@@ -220,7 +220,7 @@ pub fn open_external(url: String) -> Result<(), String> {
     let (program, prefix): (&str, &[&str]) = ("cmd", &["/c", "start", ""]);
     #[cfg(target_os = "linux")]
     let (program, prefix): (&str, &[&str]) = ("xdg-open", &[]);
-    std::process::Command::new(program)
+    crate::silent_command(program)
         .args(prefix)
         .arg(trimmed)
         .spawn()

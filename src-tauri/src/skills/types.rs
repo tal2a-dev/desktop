@@ -16,7 +16,7 @@ pub enum SyncMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillStorageLocation {
-    /// NAPI Desktop managed SSOT (`<config>/skills/`). Serde name kept as `cc_switch` for the copied UI.
+    /// tal2a managed SSOT (`<config>/skills/`). Serde name kept as `cc_switch` for the copied UI.
     #[default]
     CcSwitch,
     /// Agent Skills unified directory (`~/.agents/skills/`).

@@ -1,6 +1,6 @@
 # tal2a
 
-A desktop control panel for the [NAPI](https://napi.mikawi.org) AI gateway. It finds the
+A desktop control panel for the [NAPI](https://tal2a.app) AI gateway. It finds the
 coding agents already installed on your machine, points them at NAPI in one click, launches
 them, and shows your plan and quota — so you stop hand-editing JSON and TOML config files.
 
@@ -47,7 +47,7 @@ bun install
 bun run tauri dev
 ```
 
-This repo often lives on ExFAT (`nvm_500`). macOS writes AppleDouble `._*` sidecars there; Tauri's build script then panics on `._default.toml` (not UTF-8). `bun run tauri` forces `CARGO_TARGET_DIR` onto APFS at `~/.cache/napi-desktop/target`. Override with `NAPI_CARGO_TARGET_DIR` if needed.
+This repo often lives on ExFAT (`nvm_500`). macOS writes AppleDouble `._*` sidecars there; Tauri's build script then panics on `._default.toml` (not UTF-8). `bun run tauri` forces `CARGO_TARGET_DIR` onto APFS at `~/.cache/tal2a/target`. Override with `TAL2A_CARGO_TARGET_DIR` if needed.
 
 For a release build:
 

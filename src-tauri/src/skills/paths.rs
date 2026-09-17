@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 
 pub fn get_home_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("NAPI_DESKTOP_TEST_HOME") {
+    if let Ok(home) = std::env::var("TAL2A_DESKTOP_TEST_HOME")
+        .or_else(|_| std::env::var("NAPI_DESKTOP_TEST_HOME"))
+    {
         let trimmed = home.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
@@ -12,11 +14,9 @@ pub fn get_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// NAPI Desktop config root. SSOT lives at `<this>/skills/`.
+/// tal2a config root. SSOT lives at `<this>/skills/`.
 pub fn get_app_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| get_home_dir().join(".config"))
-        .join("napi-desktop")
+    crate::agent_write::default_app_config_dir()
 }
 
 pub fn get_hermes_dir() -> PathBuf {

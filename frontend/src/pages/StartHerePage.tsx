@@ -158,7 +158,7 @@ export function StartHerePage() {
         </p>
         <h2 className="text-lg font-semibold">Connect your coding apps</h2>
         <p className="max-w-2xl text-sm text-muted-foreground">
-          NAPI Desktop installs and points local CLIs at{" "}
+          tal2a installs and points local CLIs at{" "}
           <span className="font-medium text-foreground">{host}</span>. That
           host is the NAPI backend — not a provider catalog.
         </p>
@@ -188,7 +188,7 @@ export function StartHerePage() {
       <div className="mb-6 rounded-xl border border-border bg-gradient-to-br from-card/80 to-card/40 p-4 shadow-sm">
         <p className="mb-3 text-sm font-medium">Getting started</p>
         <ol className="space-y-2 text-sm">
-          <CheckRow done={signedIn} label="Sign in to NAPI Desktop" />
+          <CheckRow done={signedIn} label="Sign in to tal2a" />
           <CheckRow
             done={hasInstall && counts["needs-install"] < agents.length}
             label="Install the coding apps you use"

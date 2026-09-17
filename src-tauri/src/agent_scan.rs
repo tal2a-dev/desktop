@@ -2,7 +2,6 @@
 //! (cmux / Grok session `/var/folders/.../cmux-cli-shims`).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::agent_write;
 use crate::home_dir;
@@ -95,15 +94,21 @@ fn which_real(name: &str) -> Option<PathBuf> {
     }
     // Do not inherit the app process PATH: Grok/cargo shells inject nvm + cmux
     // shims, which made leftover `gemini` look installed.
+    #[cfg(target_os = "windows")]
+    let sep = ";";
+    #[cfg(not(target_os = "windows"))]
+    let sep = ":";
     let path = bin_search_dirs()
         .iter()
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
-        .join(":");
-    let out = Command::new("sh")
+        .join(sep);
+    #[cfg(target_os = "windows")]
+    let locate = format!("where {name}");
+    #[cfg(not(target_os = "windows"))]
+    let locate = format!("command -v {name}");
+    let out = crate::shell_command(&locate)
         .env("PATH", &path)
-        .arg("-c")
-        .arg(format!("command -v {name}"))
         .output()
         .ok()?;
     if !out.status.success() {

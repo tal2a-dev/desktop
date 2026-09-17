@@ -51,7 +51,7 @@ export function LogConfigPanel({
         <div className="space-y-0.5">
           <Label>Enable diagnostic logs</Label>
           <p className="text-xs text-muted-foreground">
-            Write NAPI Desktop diagnostic logs to the logs directory
+            Write tal2a diagnostic logs to the logs directory
           </p>
         </div>
         <Switch checked={enabled} onCheckedChange={onEnabledChange} />

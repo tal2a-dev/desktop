@@ -39,6 +39,10 @@ pub struct AppSettings {
     /// NAPI `tokens.id` the desktop writes into agent configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_token_id: Option<i64>,
+    /// Per-agent model overwrite (`agent id` -> `GET /v1/models` id).
+    /// Applied by `write_agent`; empty means endpoint default.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub agent_models: std::collections::HashMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -58,8 +62,33 @@ impl Default for AppSettings {
             log_enabled: true,
             log_level: default_log_level(),
             selected_token_id: None,
+            agent_models: std::collections::HashMap::new(),
         }
     }
+}
+
+/// Stored model overwrite for one agent, if the user picked one.
+pub fn agent_model(id: &str) -> Option<String> {
+    load_app_settings()
+        .agent_models
+        .get(id)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Remember (or clear, when blank) one agent's model overwrite.
+pub fn set_agent_model_setting(id: &str, model: &str) -> Result<(), String> {
+    let mut settings = load_app_settings();
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        settings.agent_models.remove(id);
+    } else {
+        settings
+            .agent_models
+            .insert(id.to_string(), trimmed.to_string());
+    }
+    save_app_settings(&settings)
 }
 
 fn default_true() -> bool {
@@ -70,10 +99,19 @@ fn default_log_level() -> String {
     "info".into()
 }
 
+/// App slug for on-disk config. Renamed from `napi-desktop` to `tal2a`;
+/// existing installs are moved forward once, transparently.
+pub const APP_SLUG: &str = "tal2a";
+pub const LEGACY_APP_SLUG: &str = "napi-desktop";
+
 pub fn default_app_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| home_dir().join(".config"))
-        .join("napi-desktop")
+    let base = dirs::config_dir().unwrap_or_else(|| home_dir().join(".config"));
+    let next = base.join(APP_SLUG);
+    let legacy = base.join(LEGACY_APP_SLUG);
+    if !next.exists() && legacy.exists() {
+        let _ = fs::rename(&legacy, &next);
+    }
+    next
 }
 
 fn settings_path() -> PathBuf {
@@ -133,7 +171,7 @@ fn default_dir_for(app: &str) -> PathBuf {
     }
 }
 
-/// Resolved config directory for an agent (or `"app"` for NAPI Desktop).
+/// Resolved config directory for an agent (or `"app"` for tal2a).
 /// Empty / missing overrides fall back to the platform default. `~` is expanded.
 pub fn config_dir_for(app: &str) -> PathBuf {
     let settings = load_app_settings();
@@ -227,6 +265,30 @@ fn upsert_json_env(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
         map.insert((*k).into(), Value::String((*val).into()));
     }
     write_json(path, &v)
+}
+
+/// Pin a top-level `"model"` in a JSON config. `None` leaves the file
+/// untouched so an overwrite never clobbers the user's own model.
+/// Other keys are always preserved.
+fn apply_json_top_model(path: &Path, model: Option<&str>) -> Result<(), String> {
+    let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let mut v = load_json(path);
+    let Some(map) = v.as_object_mut() else {
+        return Ok(());
+    };
+    map.insert("model".into(), Value::String(m.to_string()));
+    write_json(path, &v)
+}
+
+/// True when the file's pinned model is one NAPI wrote (matches the stored
+/// pick), so `clear_napi` only removes its own overlay, never the user's.
+fn is_napi_model_pin(current: Option<&str>, stored: Option<&str>) -> bool {
+    match (current.map(str::trim), stored.map(str::trim)) {
+        (Some(c), Some(s)) => !c.is_empty() && c == s,
+        _ => false,
+    }
 }
 
 fn write_env_file(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
@@ -459,13 +521,24 @@ fn apply_codex_toml(
     doc.to_string()
 }
 
-fn write_codex(api_key: &str, base_url: &str) -> Result<(), String> {
+fn write_codex(api_key: &str, base_url: &str, model: Option<&str>) -> Result<(), String> {
     let dir = config_dir_for("codex");
     let path = dir.join("config.toml");
     ensure_parent(&path)?;
     let catalog_path = dir.join("tal2a-models.json");
     let ids = fetch_v1_model_ids_blocking(base_url, api_key).unwrap_or_default();
     let (catalog, default_model) = build_codex_catalog(&ids);
+    // Explicit per-agent pick wins; otherwise the live catalog default.
+    // `apply_codex_toml` only fills an empty `model`, so drop a stale pin
+    // first when the user picked one — profiles are untouched.
+    let have_override = model
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    let chosen = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(default_model);
     let catalog_arg = if catalog
         .get("models")
         .and_then(Value::as_array)
@@ -476,13 +549,19 @@ fn write_codex(api_key: &str, base_url: &str) -> Result<(), String> {
     } else {
         None
     };
-    let content = fs::read_to_string(&path).unwrap_or_default();
+    let mut content = fs::read_to_string(&path).unwrap_or_default();
+    if have_override {
+        if let Ok(mut pre) = content.parse::<toml_edit::DocumentMut>() {
+            pre.remove("model");
+            content = pre.to_string();
+        }
+    }
     let next = apply_codex_toml(
         &content,
         api_key,
         base_url,
         catalog_arg,
-        default_model.as_deref(),
+        chosen.as_deref(),
     );
     atomic_write(&path, next.as_bytes())?;
 
@@ -666,7 +745,7 @@ fn claude_desktop_paths_for_home(home: &Path) -> ClaudeDesktopPaths {
 }
 
 /// OpenAI `{ data: [{ id }] }` and Anthropic `{ data: [{ id, display_name }] }`.
-fn parse_v1_model_ids(body: &Value) -> Vec<String> {
+pub(crate) fn parse_v1_model_ids(body: &Value) -> Vec<String> {
     let Some(data) = body.get("data").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -781,6 +860,10 @@ fn build_claude_desktop_gateway_profile(
         profile["inferenceModels"] = Value::Array(models);
     }
     profile
+}
+
+pub(crate) async fn live_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    fetch_v1_model_ids(base_url, api_key).await
 }
 
 async fn fetch_v1_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
@@ -959,11 +1042,12 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
     let id = resolve_agent_id(agent);
     let home = home_dir();
     let settings = load_app_settings();
-    // Desktop persists the NAPI origin (`https://napi.mikawi.org`). Clients
+    // Desktop persists the NAPI origin (`https://tal2a.app`). Clients
     // that speak Anthropic/Gemini append `/v1/messages` or `/v1beta/…`
     // themselves. OpenAI-compat clients need `{origin}/v1`.
     let origin = napi_origin(base_url);
     let v1 = openai_compat_v1(base_url);
+    let model = agent_model(&id);
 
     match id.as_str() {
         "claude" => {
@@ -979,6 +1063,7 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
             // which trips Claude Code's auth-conflict warning. The correct
             // shape is BASE_URL + AUTH_TOKEN only, so drop any stale key.
             let _ = strip_json_env_keys(&path, &["ANTHROPIC_API_KEY"]);
+            apply_json_top_model(&path, model.as_deref())?;
             if settings.enable_claude_plugin_integration {
                 let _ = apply_claude_plugin();
             }
@@ -987,7 +1072,7 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
             }
         }
         "claude-desktop" => write_claude_desktop(api_key, base_url)?,
-        "codex" => write_codex(api_key, base_url)?,
+        "codex" => write_codex(api_key, base_url, model.as_deref())?,
         "cline" => {
             let path = home.join(".cline").join("data").join("globalState.json");
             let mut v = load_json(&path);
@@ -1006,6 +1091,9 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
             provider.insert("name".into(), Value::String("NAPI".into()));
             provider.insert("apiKey".into(), Value::String(api_key.into()));
             provider.insert("baseUrl".into(), Value::String(v1.clone()));
+            if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                provider.insert("model".into(), Value::String(m.to_string()));
+            }
             write_json(&path, &v)?;
         }
         "opencode" => {
@@ -1030,9 +1118,20 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
                             "baseURL": v1,
                         }
                     });
-                    if let Some(models) = omni_models {
-                        napi_entry["models"] = models;
+                    // Publish every live model: OpenCode treats config
+                    // `models` as a record keyed by id, and minimal `{}`
+                    // entries inherit sane defaults (name = id, toolcall on).
+                    let mut merged = match omni_models {
+                        Some(Value::Object(o)) => o,
+                        _ => serde_json::Map::new(),
+                    };
+                    for id in fetch_v1_model_ids_blocking(base_url, api_key).unwrap_or_default() {
+                        let id = id.trim();
+                        if !id.is_empty() && !merged.contains_key(id) {
+                            merged.insert(id.to_string(), json!({}));
+                        }
                     }
+                    napi_entry["models"] = Value::Object(merged);
                     map.insert("napi".into(), napi_entry);
                 }
                 let enabled = root
@@ -1052,6 +1151,10 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
                     map.insert("ANTHROPIC_API_KEY".into(), Value::String(api_key.into()));
                     map.insert("ANTHROPIC_BASE_URL".into(), Value::String(origin.clone()));
                 }
+                // OpenCode resolves `model: "napi/<id>"` against the provider above.
+                if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    root.insert("model".into(), Value::String(format!("napi/{m}")));
+                }
             }
             remap_provider_prefix(&mut v, "omniroute/", "napi/");
             write_json(&path, &v)?;
@@ -1063,14 +1166,18 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
             }
         }
         "gemini" => {
+            let path = config_dir_for("gemini").join(".env");
             write_env_file(
-                &config_dir_for("gemini").join(".env"),
+                &path,
                 &[
                     ("GEMINI_API_KEY", api_key),
                     ("GEMINI_BASE_URL", origin.as_str()),
                     ("GOOGLE_GEMINI_BASE_URL", origin.as_str()),
                 ],
             )?;
+            if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                write_env_file(&path, &[("GEMINI_MODEL", m)])?;
+            }
         }
         "grok" => {
             let path = config_dir_for("grok").join("config.toml");
@@ -1081,6 +1188,9 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
                 .unwrap_or_else(|_| toml_edit::DocumentMut::new());
             doc["base_url"] = toml_edit::value(v1.as_str());
             doc["api_key"] = toml_edit::value(api_key);
+            if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                doc["model"] = toml_edit::value(m);
+            }
             atomic_write(&path, doc.to_string().as_bytes())?;
         }
         "hermes" => {
@@ -1096,6 +1206,9 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
                 map.insert("openai_api_key".into(), Value::String(api_key.into()));
                 map.insert("openai_base_url".into(), Value::String(v1.clone()));
                 map.insert("base_url".into(), Value::String(v1.clone()));
+                if let Some(m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    map.insert("model".into(), Value::String(m.to_string()));
+                }
             }
             let out = serde_yaml::to_string(&v).map_err(|e| e.to_string())?;
             atomic_write(&path, out.as_bytes())?;
@@ -1113,17 +1226,46 @@ pub fn write_agent(agent: &str, api_key: &str, base_url: &str) -> Result<String,
         "continue" => {
             let path = home.join(".continue").join("config.json");
             let mut v = load_json(&path);
+            let picked = model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            // Continue's `models` is a real list: publish every live model so
+            // the picker shows all of them, default first.
+            let live = fetch_v1_model_ids_blocking(base_url, api_key).unwrap_or_default();
+            let mut ids: Vec<String> = Vec::new();
+            if let Some(p) = picked.clone() {
+                ids.push(p);
+            }
+            for id in live {
+                if !ids.iter().any(|x| x == &id) {
+                    ids.push(id);
+                }
+            }
+            if ids.is_empty() {
+                ids.push("gpt-4o".to_string());
+            }
             if let Some(map) = v.as_object_mut() {
-                map.insert(
-                    "models".into(),
-                    json!([{
-                        "title": "NAPI",
-                        "provider": "openai",
-                        "model": "gpt-4o",
-                        "apiKey": api_key,
-                        "apiBase": v1,
-                    }]),
-                );
+                let entries: Vec<Value> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        let title = if i == 0 {
+                            "NAPI".to_string()
+                        } else {
+                            format!("NAPI {id}")
+                        };
+                        json!({
+                            "title": title,
+                            "provider": "openai",
+                            "model": id,
+                            "apiKey": api_key,
+                            "apiBase": v1,
+                        })
+                    })
+                    .collect();
+                map.insert("models".into(), Value::Array(entries));
             }
             write_json(&path, &v)?;
         }
@@ -1311,6 +1453,12 @@ fn clear_codex_napi() -> Result<String, String> {
             {
                 doc.remove("model_catalog_json");
             }
+            if is_napi_model_pin(
+                doc.get("model").and_then(|item| item.as_str()),
+                agent_model("codex").as_deref(),
+            ) {
+                doc.remove("model");
+            }
             if let Some(env) = doc.get_mut("env").and_then(|item| item.as_table_mut()) {
                 for key in ["OPENAI_API_KEY", "OPENAI_BASE_URL"] {
                     let drop = env
@@ -1395,6 +1543,17 @@ fn clear_opencode_napi() -> Result<String, String> {
         if has_omni {
             remap_provider_prefix(&mut v, "napi/", "omniroute/");
         }
+        if let Some(stored) = agent_model("opencode") {
+            let pinned = format!("napi/{stored}");
+            if is_napi_model_pin(
+                v.get("model").and_then(|m| m.as_str()),
+                Some(pinned.as_str()),
+            ) {
+                if let Some(map) = v.as_object_mut() {
+                    map.remove("model");
+                }
+            }
+        }
         write_json(&path, &v)?;
     }
     let slim = config_dir_for("opencode").join("oh-my-opencode-slim.json");
@@ -1413,14 +1572,28 @@ pub fn clear_napi(agent: &str) -> Result<String, String> {
     let home = home_dir();
     match id.as_str() {
         "claude" => {
+            let path = config_dir_for("claude").join("settings.json");
             strip_json_env_keys(
-                &config_dir_for("claude").join("settings.json"),
+                &path,
                 &[
                     "ANTHROPIC_API_KEY",
                     "ANTHROPIC_BASE_URL",
                     "ANTHROPIC_AUTH_TOKEN",
                 ],
             )?;
+            if path.is_file() {
+                let v = load_json(&path);
+                if is_napi_model_pin(
+                    v.get("model").and_then(|m| m.as_str()),
+                    agent_model("claude").as_deref(),
+                ) {
+                    let mut owned = v;
+                    if let Some(map) = owned.as_object_mut() {
+                        map.remove("model");
+                    }
+                    write_json(&path, &owned)?;
+                }
+            }
             let plugin = config_dir_for("claude").join("config.json");
             if plugin.is_file() {
                 let mut v = load_json(&plugin);
@@ -1451,10 +1624,23 @@ pub fn clear_napi(agent: &str) -> Result<String, String> {
         }
         "opencode" => clear_opencode_napi(),
         "gemini" => {
+            let env_path = config_dir_for("gemini").join(".env");
             strip_dotenv_keys(
-                &config_dir_for("gemini").join(".env"),
+                &env_path,
                 &["GEMINI_API_KEY", "GEMINI_BASE_URL", "GOOGLE_GEMINI_BASE_URL"],
             )?;
+            if env_path.is_file() {
+                let matches_stored = fs::read_to_string(&env_path).map(|raw| {
+                    raw.lines().any(|line| {
+                        let (k, v) = line.split_once('=').unwrap_or(("", ""));
+                        k.trim() == "GEMINI_MODEL"
+                            && is_napi_model_pin(Some(v.trim()), agent_model("gemini").as_deref())
+                    })
+                });
+                if matches_stored.unwrap_or(false) {
+                    strip_dotenv_keys(&env_path, &["GEMINI_MODEL"])?;
+                }
+            }
             Ok("stripped NAPI from Gemini .env".into())
         }
         "grok" => {
@@ -1470,6 +1656,12 @@ pub fn clear_napi(agent: &str) -> Result<String, String> {
                         doc.remove("base_url");
                         doc.remove("api_key");
                     }
+                    if is_napi_model_pin(
+                        doc.get("model").and_then(|i| i.as_str()),
+                        agent_model("grok").as_deref(),
+                    ) {
+                        doc.remove("model");
+                    }
                     atomic_write(&path, doc.to_string().as_bytes())?;
                 }
             }
@@ -1483,6 +1675,12 @@ pub fn clear_napi(agent: &str) -> Result<String, String> {
                     if let Some(map) = v.as_object_mut() {
                         for k in ["openai_api_key", "openai_base_url", "base_url"] {
                             map.remove(k);
+                        }
+                        if is_napi_model_pin(
+                            map.get("model").and_then(|m| m.as_str()),
+                            agent_model("hermes").as_deref(),
+                        ) {
+                            map.remove("model");
                         }
                     }
                     let out = serde_yaml::to_string(&v).map_err(|e| e.to_string())?;
@@ -1626,6 +1824,7 @@ mod tests {
     #[test]
     fn looks_like_napi_host() {
         assert!(looks_like_napi("https://tal2a.app/v1"));
+        // Deprecated host must still be recognized so old overlays get stripped.
         assert!(looks_like_napi("https://napi.mikawi.org/v1"));
         assert!(!looks_like_napi("https://api.openai.com"));
     }
@@ -1688,47 +1887,91 @@ mod tests {
     }
 
     #[test]
+    fn json_top_model_sets_and_leaves_alone() {
+        let dir = std::env::temp_dir().join(format!(
+            "napi-top-model-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"env":{"X":"1"},"other":2}"#).unwrap();
+        apply_json_top_model(&path, Some("grok-4")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["model"], "grok-4");
+        assert_eq!(v["env"]["X"], "1");
+        // No pick: user's own pin must survive an overwrite.
+        fs::write(&path, r#"{"model":"mine","other":2}"#).unwrap();
+        apply_json_top_model(&path, None).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["model"], "mine");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn napi_model_pin_matches_only_own_overlay() {
+        assert!(is_napi_model_pin(Some("grok-4"), Some("grok-4")));
+        assert!(!is_napi_model_pin(Some("mine"), Some("grok-4")));
+        assert!(!is_napi_model_pin(Some("grok-4"), None));
+        assert!(!is_napi_model_pin(None, Some("grok-4")));
+        assert!(!is_napi_model_pin(Some("  "), Some("  ")));
+    }
+
+    #[test]
+    fn codex_catalog_default_never_clobbers_existing_model() {
+        let out = apply_codex_toml(
+            "model = \"mine\"\n",
+            "sk-test",
+            "https://tal2a.app",
+            None,
+            Some("gpt-5.6-sol"),
+        );
+        assert!(out.contains("model = \"mine\""), "got:\n{out}");
+    }
+
+    #[test]
     fn openai_compat_v1_appends_once() {
         assert_eq!(
-            openai_compat_v1("https://napi.mikawi.org"),
-            "https://napi.mikawi.org/v1"
+            openai_compat_v1("https://tal2a.app"),
+            "https://tal2a.app/v1"
         );
         assert_eq!(
-            openai_compat_v1("https://napi.mikawi.org/v1/"),
-            "https://napi.mikawi.org/v1"
+            openai_compat_v1("https://tal2a.app/v1/"),
+            "https://tal2a.app/v1"
         );
     }
 
     #[test]
     fn napi_origin_strips_v1() {
         assert_eq!(
-            napi_origin("https://napi.mikawi.org"),
-            "https://napi.mikawi.org"
+            napi_origin("https://tal2a.app"),
+            "https://tal2a.app"
         );
         assert_eq!(
-            napi_origin("https://napi.mikawi.org/"),
-            "https://napi.mikawi.org"
+            napi_origin("https://tal2a.app/"),
+            "https://tal2a.app"
         );
         assert_eq!(
-            napi_origin("https://napi.mikawi.org/v1"),
-            "https://napi.mikawi.org"
+            napi_origin("https://tal2a.app/v1"),
+            "https://tal2a.app"
         );
         assert_eq!(
-            napi_origin("https://napi.mikawi.org/v1/"),
-            "https://napi.mikawi.org"
+            napi_origin("https://tal2a.app/v1/"),
+            "https://tal2a.app"
         );
     }
 
     #[test]
     fn apply_codex_toml_replaces_inline_empty_table() {
-        let existing = "openai_base_url = \"https://napi.mikawi.org\"\nmodel_provider = \"napi\"\nmodel_providers = {}\n";
-        let out = apply_codex_toml(existing, "sk-test", "https://napi.mikawi.org", None, None);
+        let existing = "openai_base_url = \"https://tal2a.app\"\nmodel_provider = \"napi\"\nmodel_providers = {}\n";
+        let out = apply_codex_toml(existing, "sk-test", "https://tal2a.app", None, None);
         assert!(
             out.contains("[model_providers.napi]"),
             "expected dotted napi table, got:\n{out}"
         );
-        assert!(out.contains("base_url = \"https://napi.mikawi.org/v1\""));
-        assert!(out.contains("openai_base_url = \"https://napi.mikawi.org/v1\""));
+        assert!(out.contains("base_url = \"https://tal2a.app/v1\""));
+        assert!(out.contains("openai_base_url = \"https://tal2a.app/v1\""));
         assert!(out.contains("wire_api = \"responses\""));
         assert!(!out.contains("model_providers = {}"));
         assert!(!out.contains("api_key ="));
@@ -1744,7 +1987,7 @@ base_url = "http://127.0.0.1:4000/v1"
         let out = apply_codex_toml(
             existing,
             "sk-test",
-            "https://napi.mikawi.org/v1",
+            "https://tal2a.app/v1",
             None,
             None,
         );
@@ -1760,7 +2003,7 @@ base_url = "http://127.0.0.1:4000/v1"
 name = "other"
 base_url = "https://9router.mikawi.org/v1"
 "#;
-        let out = apply_codex_toml(existing, "sk-test", "https://napi.mikawi.org", None, None);
+        let out = apply_codex_toml(existing, "sk-test", "https://tal2a.app", None, None);
         assert!(
             !out.contains("9router.mikawi.org"),
             "9router must not survive a NAPI overwrite:\n{out}"
@@ -1883,7 +2126,7 @@ sandbox_mode = "workspace-write"
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let paths = claude_desktop_paths_from_dirs(dir.join("Claude"), dir.join("Claude-3p"));
-        apply_claude_desktop_3p_at(&paths, "sk-test", "https://napi.mikawi.org", &[]).unwrap();
+        apply_claude_desktop_3p_at(&paths, "sk-test", "https://tal2a.app", &[]).unwrap();
 
         let normal: Value =
             serde_json::from_str(&fs::read_to_string(&paths.normal_config_path).unwrap()).unwrap();
@@ -1900,7 +2143,7 @@ sandbox_mode = "workspace-write"
         assert_eq!(profile["inferenceGatewayAuthScheme"], "bearer");
         assert_eq!(
             profile["inferenceGatewayBaseUrl"],
-            "https://napi.mikawi.org"
+            "https://tal2a.app"
         );
         assert_eq!(profile["inferenceGatewayApiKey"], "sk-test");
         assert!(profile.get("inferenceModels").is_none());
@@ -1941,7 +2184,7 @@ sandbox_mode = "workspace-write"
         apply_claude_desktop_3p_at(
             &paths,
             "sk-test",
-            "https://napi.mikawi.org/v1",
+            "https://tal2a.app/v1",
             &[],
         )
         .unwrap();
@@ -1955,7 +2198,7 @@ sandbox_mode = "workspace-write"
             serde_json::from_str(&fs::read_to_string(&paths.profile_path).unwrap()).unwrap();
         assert_eq!(
             profile["inferenceGatewayBaseUrl"],
-            "https://napi.mikawi.org"
+            "https://tal2a.app"
         );
 
         let meta: Value =
@@ -2047,7 +2290,7 @@ sandbox_mode = "workspace-write"
         apply_claude_desktop_3p_at(
             &paths,
             "sk-test",
-            "https://napi.mikawi.org",
+            "https://tal2a.app",
             &catalog,
         )
         .unwrap();

@@ -64,8 +64,7 @@ fn create_backup(conflicts: &[EnvConflict]) -> Result<BackupInfo, String> {
 
 /// Get backup directory path
 fn get_backup_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-    Ok(home.join(".config").join("napi-desktop").join("backups"))
+    Ok(crate::agent_write::default_app_config_dir().join("backups"))
 }
 
 fn unset_process_var(name: &str) {
@@ -205,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_delete_process_env_unsets_current_process() {
-        let name = "NAPI_DESKTOP_TEST_ENV_DELETE";
+        let name = "TAL2A_DESKTOP_TEST_ENV_DELETE";
         unsafe { std::env::set_var(name, "to-remove") };
         let conflict = EnvConflict {
             var_name: name.into(),

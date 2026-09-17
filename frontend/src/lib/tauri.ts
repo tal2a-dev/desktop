@@ -260,7 +260,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return [
         {
           id: 1,
-          name: "napi-desktop",
+          name: "tal2a-desktop",
           status: 1,
           remainQuota: 0,
           usedQuota: 12000,
@@ -303,14 +303,20 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         tokenUsed: 410_000,
         points: [],
       } as T;
+    case "list_models":
+      return ["grok-4", "claude-sonnet-5", "gpt-5.6-sol"] as T;
+    case "get_agent_models":
+      return {} as T;
+    case "set_agent_model":
+      return `Demo mode — ${a.agentName} model not actually changed.` as T;
     case "save_app_settings":
       return undefined as T;
     case "pick_directory":
       return ((a.defaultPath as string | undefined) ??
-        "/Users/demo/.config/napi-desktop") as T;
+        "/Users/demo/.config/tal2a") as T;
     case "get_resolved_directories":
       return {
-        appConfig: "/Users/demo/.config/napi-desktop",
+        appConfig: "/Users/demo/.config/tal2a",
         claude: "/Users/demo/.claude",
         codex: "/Users/demo/.codex",
         gemini: "/Users/demo/.gemini",
@@ -390,7 +396,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "open_path":
       return undefined as T;
     case "open_logs_dir":
-      return "/Users/demo/.config/napi-desktop/logs" as T;
+      return "/Users/demo/.config/tal2a/logs" as T;
     case "launch_agent":
       return undefined as T;
     case "fetch_subscription":

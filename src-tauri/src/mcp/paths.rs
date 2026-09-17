@@ -7,10 +7,7 @@ pub fn home_dir() -> PathBuf {
 }
 
 pub fn store_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| home_dir().join(".config"))
-        .join("napi-desktop")
-        .join("mcp-servers.json")
+    crate::agent_write::default_app_config_dir().join("mcp-servers.json")
 }
 
 pub fn claude_mcp_path() -> PathBuf {

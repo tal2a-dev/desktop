@@ -2,7 +2,7 @@
 //!
 //! Adapted from cc-switch `mcp/` + `services/mcp.rs` without the provider
 //! switcher or SQLite. Canonical records live in
-//! `~/.config/napi-desktop/mcp-servers.json` and are projected into
+//! `~/.config/tal2a/mcp-servers.json` and are projected into
 //! `~/.claude.json` / Codex / Gemini / Grok / OpenCode / Hermes / Cursor.
 
 mod commands;

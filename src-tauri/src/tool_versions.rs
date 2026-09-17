@@ -2,7 +2,6 @@
 
 use serde::Serialize;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -48,10 +47,19 @@ fn valid_tool_name(name: &str) -> bool {
 }
 
 fn run_login_shell(script: &str) -> std::io::Result<std::process::Output> {
-    Command::new("sh")
-        .args(["-lc", script])
-        .env("PATH", extra_path())
-        .output()
+    #[cfg(target_os = "windows")]
+    {
+        crate::shell_command(script)
+            .env("PATH", extra_path())
+            .output()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        crate::silent_command("sh")
+            .args(["-lc", script])
+            .env("PATH", extra_path())
+            .output()
+    }
 }
 
 /// First `major.minor` / `major.minor.patch` token in stdout/stderr.
@@ -103,7 +111,11 @@ fn probe_local(tool: &str) -> (Option<String>, Option<String>, bool, Option<Stri
         return (None, Some(format!("invalid tool name: {tool}")), false, None);
     }
 
-    let which = run_login_shell(&format!("command -v {tool} || which {tool}"));
+    #[cfg(target_os = "windows")]
+    let locate = format!("where {tool}");
+    #[cfg(not(target_os = "windows"))]
+    let locate = format!("command -v {tool} || which {tool}");
+    let which = run_login_shell(&locate);
     let install_path = which.ok().and_then(|out| {
         if !out.status.success() {
             return None;
@@ -197,7 +209,7 @@ async fn fetch_github_latest_tag(client: &reqwest::Client, repo: &str) -> Option
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let resp = client
         .get(&url)
-        .header("User-Agent", "napi-desktop")
+        .header("User-Agent", "tal2a")
         .header("Accept", "application/vnd.github+json")
         .timeout(PROBE_TIMEOUT)
         .send()

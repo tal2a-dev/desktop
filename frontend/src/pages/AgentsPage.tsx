@@ -5,6 +5,13 @@ import { Input } from "@/components/ui/input.tsx";
 import { cn } from "@/lib/utils.ts";
 import { AgentIcon } from "@/components/AgentIcon.tsx";
 import { ChatgptDesktopDownload } from "@/components/ChatgptDesktopDownload.tsx";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select.tsx";
 import { invoke } from "../lib/tauri.ts";
 import { useAuth } from "../lib/auth";
 import { settingsApi } from "@/lib/api.ts";
@@ -82,6 +89,54 @@ export function AgentsPage() {
     null,
   );
   const [inlineErr, setInlineErr] = useState<Record<string, string>>({});
+  const [liveModels, setLiveModels] = useState<string[]>([]);
+  const [modelsErr, setModelsErr] = useState<string | null>(null);
+  const [agentModels, setAgentModels] = useState<Record<string, string>>({});
+  const [modelBusy, setModelBusy] = useState<string | null>(null);
+
+  const loadModels = useCallback(async () => {
+    try {
+      const [ids, stored] = await Promise.all([
+        invoke<string[]>("list_models", { baseUrl: state.baseUrl }),
+        invoke<Record<string, string>>("get_agent_models"),
+      ]);
+      setLiveModels(Array.isArray(ids) ? ids : []);
+      setAgentModels(stored ?? {});
+      setModelsErr(null);
+    } catch (e) {
+      setLiveModels([]);
+      setModelsErr(String(e));
+    }
+  }, [state.baseUrl]);
+
+  useEffect(() => {
+    void loadModels();
+  }, [loadModels]);
+
+  // ponytail: the pick is remembered server-side and rewritten into that
+  // agent's config at once — no separate Apply step.
+  const changeModel = async (a: AgentConfig, picked: string) => {
+    const model = picked === "__default__" ? "" : picked;
+    setModelBusy(a.id);
+    try {
+      const msg = await invoke<string>("set_agent_model", {
+        agentName: a.id,
+        model,
+      });
+      setAgentModels((m) => {
+        const next = { ...m };
+        if (model) next[a.id] = model;
+        else delete next[a.id];
+        return next;
+      });
+      toast.success(msg);
+      await scan();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setModelBusy(null);
+    }
+  };
 
   const scan = useCallback(async () => {
     setLoading(true);
@@ -404,6 +459,55 @@ export function AgentsPage() {
                       <p className="truncate text-sm text-muted-foreground">
                         {a.description || a.config_path}
                       </p>
+                      {a.config_type === "auto" && (
+                        <div className="flex items-center gap-2 pt-1">
+                          <span className="text-[11px] text-muted-foreground">
+                            Model
+                          </span>
+                          <Select
+                            value={agentModels[a.id] ?? "__default__"}
+                            onValueChange={(v) => void changeModel(a, v)}
+                            disabled={
+                              modelBusy === a.id ||
+                              liveModels.length === 0
+                            }
+                          >
+                            <SelectTrigger
+                              className="h-7 w-[220px] text-xs"
+                              aria-label={`Model for ${a.name}`}
+                            >
+                              <SelectValue
+                                placeholder={
+                                  modelsErr
+                                    ? "Models unavailable"
+                                    : "Endpoint default"
+                                }
+                              />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="__default__">
+                                Endpoint default
+                              </SelectItem>
+                              {agentModels[a.id] &&
+                                !liveModels.includes(agentModels[a.id]) && (
+                                  <SelectItem value={agentModels[a.id]}>
+                                    {agentModels[a.id]} (saved)
+                                  </SelectItem>
+                                )}
+                              {liveModels.map((m) => (
+                                <SelectItem key={m} value={m}>
+                                  {m}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          {modelBusy === a.id && (
+                            <span className="text-[11px] text-muted-foreground">
+                              Writing…
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">

@@ -177,7 +177,7 @@ pub async fn ensure_desktop_key(base_url: &str) -> Result<(), String> {
     }
     if let Some(ours) = keys
         .iter()
-        .filter(|k| k.name == "napi-desktop" && k.status == 1)
+        .filter(|k| (k.name == "tal2a-desktop" || k.name == "napi-desktop") && k.status == 1)
         .max_by_key(|k| k.id)
     {
         if have_secret {
@@ -201,7 +201,7 @@ pub async fn ensure_desktop_key(base_url: &str) -> Result<(), String> {
         .post(format!("{base}/api/token/"))
         .header("Authorization", format!("Bearer {session}"))
         .json(&serde_json::json!({
-            "name": "napi-desktop",
+            "name": "tal2a-desktop",
             "remain_quota": 0,
             "unlimited_quota": true,
             "expired_time": -1
@@ -303,4 +303,14 @@ pub async fn select_api_key(base_url: String, token_id: i64) -> Result<ApiKeyInf
 #[tauri::command]
 pub async fn fetch_weekly_usage(base_url: String) -> Result<WeeklyUsage, String> {
     weekly_usage(&base_url).await
+}
+
+/// Live model ids from `GET {origin}/v1/models` for the model dropdowns.
+#[tauri::command]
+pub async fn list_models(base_url: String) -> Result<Vec<String>, String> {
+    validate_base_url(&base_url)?;
+    let key = crate::stored_api_key()?
+        .or_else(|| stored_token().ok().flatten())
+        .ok_or(NOT_SIGNED_IN)?;
+    agent_write::live_model_ids(&base_url, &key).await
 }

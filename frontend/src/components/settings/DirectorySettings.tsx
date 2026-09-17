@@ -52,17 +52,17 @@ export function DirectorySettings({
       <section className="space-y-4">
         <header className="space-y-1">
           <h3 className="text-sm font-medium">
-            NAPI Desktop Configuration Directory
+            tal2a Configuration Directory
           </h3>
           <p className="text-xs text-muted-foreground">
-            Override the default location of the NAPI Desktop configuration
+            Override the default location of the tal2a configuration
             directory
           </p>
         </header>
         <DirectoryInput
           value={settings.appConfigDir}
           resolvedValue={resolvedDirs.appConfig}
-          placeholder="e.g. ~/.config/napi-desktop"
+          placeholder="e.g. ~/.config/tal2a"
           onChange={onAppConfigChange}
           onBrowse={onBrowseAppConfig}
           onReset={onResetAppConfig}

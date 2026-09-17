@@ -1,8 +1,6 @@
 //! CLI install/update commands copied from cc-switch `commands/misc.rs`
 //! (`npm_install_command_for`, `HERMES_INSTALL_UNIX`, `official_update_args`).
 
-use std::process::Command;
-
 const CLAUDE_INSTALL_UNIX: &str =
     "bash -c 'tmp=$(mktemp) && curl -fsSL https://claude.ai/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
 const OPENCODE_INSTALL_UNIX: &str =
@@ -40,6 +38,11 @@ fn installer_or_npm(installer: &str, tool: &str) -> String {
 }
 
 fn install_command(tool: &str) -> Option<String> {
+    // Windows has no `sh`/curl-pipe shell lines: npm shims run under cmd.
+    // Hermes ships a bash installer only, so it stays manual there.
+    if cfg!(target_os = "windows") {
+        return npm_install_command_for(tool);
+    }
     Some(match tool {
         "claude" => installer_or_npm(CLAUDE_INSTALL_UNIX, tool),
         "grok" => installer_or_npm(GROK_INSTALL_UNIX, tool),
@@ -51,6 +54,9 @@ fn install_command(tool: &str) -> Option<String> {
 
 fn update_command(tool: &str) -> Option<String> {
     if tool == "hermes" {
+        if cfg!(target_os = "windows") {
+            return None;
+        }
         return Some(HERMES_UPDATE_UNIX.to_string());
     }
     let install = npm_install_command_for(tool)?;
@@ -146,12 +152,15 @@ fn try_shell(line: &str, notes: &mut Vec<String>, label: &str) {
 }
 
 fn brew_available() -> bool {
-    Command::new("brew").arg("--version").output().is_ok()
+    crate::silent_command("brew")
+        .arg("--version")
+        .output()
+        .is_ok()
 }
 
 #[cfg(target_os = "macos")]
 fn quit_mac_app(name: &str) {
-    let _ = Command::new("osascript")
+    let _ = std::process::Command::new("osascript")
         .args(["-e", &format!("tell application \"{name}\" to quit")])
         .output();
 }
@@ -163,7 +172,7 @@ fn trash_mac_path(path: &std::path::Path, notes: &mut Vec<String>) {
     }
     let posix = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("tell application \"Finder\" to delete (POSIX file \"{posix}\" as alias)");
-    match Command::new("osascript").args(["-e", &script]).output() {
+    match std::process::Command::new("osascript").args(["-e", &script]).output() {
         Ok(out) if out.status.success() => {
             notes.push(format!("trashed {}", path.display()));
         }
@@ -246,9 +255,7 @@ pub fn uninstall_tool(tool: &str, binary_name: &str) -> Result<String, String> {
 }
 
 fn run_shell(line: &str) -> Result<String, String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(line)
+    let output = crate::shell_command(line)
         .output()
         .map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -291,6 +298,24 @@ mod tests {
         assert!(apps
             .iter()
             .any(|p| p.ends_with("Codex Computer Use.app")));
+    }
+
+    #[test]
+    fn shell_helper_runs_without_console() {
+        let out = crate::shell_command("echo tal2a")
+            .output()
+            .expect("shell helper must spawn");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("tal2a"));
+    }
+
+    #[test]
+    fn install_prefers_scripted_installer_with_npm_fallback() {
+        let line = install_command("claude").expect("claude installs");
+        assert!(line.contains("@anthropic-ai/claude-code"));
+        // Windows-only tools have no command line at all.
+        assert!(install_command("cline").is_none());
+        assert!(install_command("cursor").is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# NAPI Desktop App — Comprehensive Build Prompt
+# tal2a App — Comprehensive Build Prompt
 
 ## 1. Project State
 
@@ -54,7 +54,7 @@ frontend/src/vite-env.d.ts
 
 ## 2. Backend API Reference
 
-Base URL: `https://napi.mikawi.org`
+Base URL: `https://tal2a.app`
 
 | Endpoint                          | Method | Auth         | Status           | Response Shape                                                                                                                                                                 | Notes                                                                                                                                                          |
 | --------------------------------- | ------ | ------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -181,7 +181,7 @@ Base URL: `https://napi.mikawi.org`
 
 - **Use `keyring` crate** (cross-platform OS keychain: macOS Keychain, Windows Credential Manager, Linux Secret Service)
 - Add to Cargo.toml: `keyring = "3"`
-- Store: service name `"napi-desktop"`, username `"user-token"`
+- Store: service name `"tal2a"`, username `"user-token"`
 - NEVER log, print, or serialize tokens to disk outside keychain
 - Frontend never sees raw token — pass through Tauri commands that use it server-side
 
@@ -208,7 +208,7 @@ Base URL: `https://napi.mikawi.org`
 | Requirement                  | API Available                            | Implementation                                                                                                       |
 | ---------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | Dashboard login              | `/api/user/login` (POST, no auth)        | Build login form → Tauri `login` command → store token in keychain                                                   |
-| Auth against napi.mikawi.org | Verified endpoints accept Bearer         | All authenticated calls go through Tauri commands that inject token from keychain                                    |
+| Auth against tal2a.app | Verified endpoints accept Bearer         | All authenticated calls go through Tauri commands that inject token from keychain                                    |
 | Agent scanner                | N/A (local filesystem)                   | Fix existing `scan_agents`: correct Claude key field, add binary existence check                                     |
 | Per-agent config rewriter    | N/A (local filesystem)                   | Fix existing `reconfigure_agent`: replace regex TOML with `toml_edit`, add atomic writes, add Cline/OpenCode support |
 | Native agent launcher        | N/A (local process)                      | New `launch_agent` command: `std::process::Command` with platform-appropriate spawn                                  |
@@ -317,7 +317,7 @@ Each step is independently assignable. Dependencies noted.
 
 ### No Hardcoded Secrets
 
-- Base URL configurable (default `https://napi.mikawi.org`)
+- Base URL configurable (default `https://tal2a.app`)
 - No API keys in source code
 - No test credentials committed
 

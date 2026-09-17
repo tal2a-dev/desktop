@@ -126,7 +126,7 @@ export function ApiKeyPicker() {
       ) : keys.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           No API keys on this account. Sign-in setup will mint{" "}
-          <span className="font-mono">napi-desktop</span>.
+          <span className="font-mono">tal2a-desktop</span>.
         </p>
       ) : (
         <ul className="space-y-2">

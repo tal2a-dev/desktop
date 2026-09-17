@@ -249,7 +249,7 @@ export function SettingsPage() {
               onToggle={() => toggleSection("directory")}
               icon={<FolderSearch className="h-5 w-5 text-primary" />}
               title="Configuration Directory"
-              description="Manage storage paths for NAPI Desktop and coding app configurations"
+              description="Manage storage paths for tal2a and coding app configurations"
             >
               <DirectorySettings
                 settings={settings}

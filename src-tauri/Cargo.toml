@@ -1,14 +1,14 @@
 [package]
-name = "napi-desktop"
+name = "tal2a"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "napi_desktop_lib"
+name = "tal2a_lib"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "napi-desktop"
+name = "tal2a"
 path = "src/main.rs"
 
 [build-dependencies]

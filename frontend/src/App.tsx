@@ -14,7 +14,6 @@ import { SettingsPage } from "./pages/SettingsPage";
 import { StartHerePage } from "./pages/StartHerePage";
 import { EnvWarningBanner, type EnvConflict } from "./components/EnvWarningBanner.tsx";
 import { McpIcon } from "./components/BrandIcons.tsx";
-import { BrandLockup } from "./components/BrandLockup.tsx";
 import { AutoUpdateCheck } from "./components/AppUpdater.tsx";
 import { cn } from "./lib/utils.ts";
 
@@ -57,7 +56,7 @@ function friendlySetupLine(raw: string): string {
     return "Not signed in.";
   }
   if (/already exists in the keychain/i.test(raw) || /secure storage failure/i.test(raw)) {
-    return "Keychain already has a NAPI Desktop login — retry to reuse it, or delete the napi-desktop items in Keychain Access.";
+    return "Keychain already has a tal2a login — retry to reuse it, or delete the tal2a items in Keychain Access.";
   }
   return raw;
 }
@@ -249,7 +248,7 @@ function Dashboard(props: BannerProps) {
               </>
             ) : (
               <div className="flex items-center gap-2">
-                <BrandLockup heightClass="h-7" />
+                <span className="text-lg font-semibold">tal2a</span>
                 <span className="max-w-[240px] truncate text-xs text-muted-foreground">
                   {state.baseUrl.replace(/^https?:\/\//, "")}
                 </span>

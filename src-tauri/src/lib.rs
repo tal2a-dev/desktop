@@ -83,10 +83,7 @@ fn canonicalize_base_url(url: &str) -> String {
 }
 
 fn base_url_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| home_dir().join(".config"))
-        .join("napi-desktop")
-        .join("base_url")
+    agent_write::default_app_config_dir().join("base_url")
 }
 
 pub fn set_base_url(url: &str) -> Result<(), String> {
@@ -687,6 +684,38 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Spawn a child without flashing a console window on Windows.
+/// Console-subsystem programs (cmd, npm, node CLIs) otherwise pop a visible
+/// conhost window for every probe — and scans loop over ~18 tools.
+pub(crate) fn silent_command(program: &str) -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(not(target_os = "windows"))]
+    let cmd = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
+/// `sh -c` on unix, `cmd /C` on Windows (there is no `sh` there).
+pub(crate) fn shell_command(line: &str) -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = silent_command("cmd");
+        cmd.args(["/C", line]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = silent_command("sh");
+        cmd.args(["-c", line]);
+        cmd
+    }
+}
+
 /// Hand a URL to the system browser.
 fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -696,7 +725,7 @@ fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let (program, prefix): (&str, &[&str]) = ("xdg-open", &[]);
 
-    std::process::Command::new(program)
+    silent_command(program)
         .args(prefix)
         .arg(url)
         .spawn()
@@ -926,17 +955,17 @@ async fn github_oauth(app: tauri::AppHandle, base_url: String) -> Result<String,
         Ok(marker) if marker.is_empty() => (
             "200 OK",
             "Signed in",
-            "You can close this tab and return to NAPI Desktop.",
+            "You can close this tab and return to tal2a.",
         ),
         Ok(_) => (
             "200 OK",
             "One more step",
-            "Return to NAPI Desktop and enter your two-factor code.",
+            "Return to tal2a and enter your two-factor code.",
         ),
         Err(e) => ("400 Bad Request", "Sign-in failed", e.as_str()),
     };
     let page = format!(
-        "<!doctype html><meta charset=utf-8><title>NAPI Desktop</title>\
+        "<!doctype html><meta charset=utf-8><title>tal2a</title>\
          <body style=\"font-family:system-ui;padding:3rem;max-width:44rem\">\
          <h1>{}</h1><p style=\"color:#444\">{}</p>",
         esc(title),
@@ -995,24 +1024,30 @@ async fn auto_setup(base_url: String) -> Result<Vec<String>, String> {
 /// "No matching entry found in secure storage". Every reader used to `?` that
 /// straight through, so a signed-out app showed a raw keychain error instead of
 /// asking the user to sign in. One helper, all callers.
-pub(crate) fn stored_token() -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new("napi-desktop", "user-token").map_err(map_keyring)?;
-    match entry.get_password() {
-        Ok(t) if !t.is_empty() => Ok(Some(t)),
-        Ok(_) => Ok(None),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(map_keyring(e)),
+/// Keychain service. Renamed from `napi-desktop` to `tal2a`;
+/// reads fall back to the legacy service so existing logins survive.
+pub(crate) const KEYCHAIN_SERVICE: &str = "tal2a";
+pub(crate) const LEGACY_KEYCHAIN_SERVICE: &str = "napi-desktop";
+
+fn read_keyring(account: &str) -> Result<Option<String>, String> {
+    for service in [KEYCHAIN_SERVICE, LEGACY_KEYCHAIN_SERVICE] {
+        let entry = keyring::Entry::new(service, account).map_err(map_keyring)?;
+        match entry.get_password() {
+            Ok(v) if !v.is_empty() => return Ok(Some(v)),
+            Ok(_) => return Ok(None),
+            Err(keyring::Error::NoEntry) => continue,
+            Err(e) => return Err(map_keyring(e)),
+        }
     }
+    Ok(None)
+}
+
+pub(crate) fn stored_token() -> Result<Option<String>, String> {
+    read_keyring("user-token")
 }
 
 pub(crate) fn stored_api_key() -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new("napi-desktop", "api-key").map_err(map_keyring)?;
-    match entry.get_password() {
-        Ok(k) if !k.is_empty() => Ok(Some(k)),
-        Ok(_) => Ok(None),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(map_keyring(e)),
-    }
+    read_keyring("api-key")
 }
 
 fn keyring_is_duplicate(err: &keyring::Error) -> bool {
@@ -1026,8 +1061,7 @@ fn keyring_is_duplicate(err: &keyring::Error) -> bool {
 fn map_keyring(err: keyring::Error) -> String {
     let s = err.to_string();
     if keyring_is_duplicate(&err) {
-        "Could not update Keychain (an old napi-desktop item is in the way). Retry."
-            .into()
+        "Could not update Keychain (an old tal2a item is in the way). Retry.".into()
     } else if s.contains("secure storage") {
         format!("Could not save login in Keychain: {s}")
     } else {
@@ -1039,13 +1073,19 @@ fn map_keyring(err: keyring::Error) -> String {
 /// "item already exists" when an older (often differently-signed) item is
 /// still in the login keychain; delete then write.
 fn set_keyring_secret(account: &str, secret: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new("napi-desktop", account).map_err(map_keyring)?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(map_keyring)?;
     match entry.get_password() {
         Ok(existing) if existing == secret => return Ok(()),
         _ => {}
     }
     match entry.set_password(secret) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Move forward: drop the legacy copy once the new one sticks.
+            if let Ok(legacy) = keyring::Entry::new(LEGACY_KEYCHAIN_SERVICE, account) {
+                let _ = legacy.delete_credential();
+            }
+            Ok(())
+        }
         Err(e) if keyring_is_duplicate(&e) => {
             let _ = entry.delete_credential();
             #[cfg(target_os = "macos")]
@@ -1054,7 +1094,7 @@ fn set_keyring_secret(account: &str, secret: &str) -> Result<(), String> {
                     .args([
                         "delete-generic-password",
                         "-s",
-                        "napi-desktop",
+                        KEYCHAIN_SERVICE,
                         "-a",
                         account,
                     ])
@@ -1097,7 +1137,7 @@ fn store_credential(token: String) -> Result<(), String> {
     match stored_token()? {
         Some(p) if p == token => Ok(()),
         _ => Err("Signed in, but the system keychain would not return the credential. \
-                  Remove the \"napi-desktop\" item in Keychain Access and try again."
+                  Remove the \"tal2a\" item in Keychain Access and try again."
             .into()),
     }
 }
@@ -1110,12 +1150,15 @@ fn load_credential() -> Result<bool, String> {
 
 #[tauri::command]
 fn clear_credential() -> Result<(), String> {
-    for service in ["user-token", "api-key"] {
-        let entry = keyring::Entry::new("napi-desktop", service).map_err(|e| e.to_string())?;
-        match entry.delete_credential() {
-            Ok(()) => {}
-            Err(keyring::Error::NoEntry) => {} // nothing stored — already logged out
-            Err(e) => return Err(e.to_string()),
+    for account in ["user-token", "api-key"] {
+        for service in [KEYCHAIN_SERVICE, LEGACY_KEYCHAIN_SERVICE] {
+            let entry =
+                keyring::Entry::new(service, account).map_err(|e| e.to_string())?;
+            match entry.delete_credential() {
+                Ok(()) => {}
+                Err(keyring::Error::NoEntry) => {} // nothing stored — already logged out
+                Err(e) => return Err(e.to_string()),
+            }
         }
     }
     Ok(())
@@ -1253,6 +1296,36 @@ fn get_app_settings() -> agent_write::AppSettings {
 #[tauri::command]
 fn save_app_settings(settings: agent_write::AppSettings) -> Result<(), String> {
     agent_write::save_app_settings(&settings)
+}
+
+/// Stored per-agent model overwrites (`agent id` -> model id).
+#[tauri::command]
+fn get_agent_models() -> std::collections::HashMap<String, String> {
+    agent_write::load_app_settings().agent_models
+}
+
+/// Remember one agent's model and rewrite that agent now.
+/// Blank `model` clears the pick (the agent keeps its endpoint + key).
+#[tauri::command]
+fn set_agent_model(agent_name: String, model: String) -> Result<String, String> {
+    let id = agent_write::resolve_agent_id(&agent_name);
+    if !agent_write::OVERWRITE_AGENT_IDS.contains(&id.as_str()) {
+        return Err(format!("Agent '{agent_name}' is not supported"));
+    }
+    agent_write::set_agent_model_setting(&id, &model)?;
+    let key = stored_api_key()?
+        .or_else(|| stored_token().ok().flatten())
+        .ok_or(NOT_SIGNED_IN)?;
+    let base_url = std::fs::read_to_string(base_url_path())
+        .map(|raw| canonicalize_base_url(raw.trim()))
+        .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+    agent_write::write_agent(&id, &key, &base_url)?;
+    let label = agent_write::agent_display_name(&id);
+    if model.trim().is_empty() {
+        Ok(format!("{label}: model cleared (endpoint default)"))
+    } else {
+        Ok(format!("{label}: model set to {}", model.trim()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1427,6 +1500,8 @@ pub fn run() {
             save_base_url,
             get_app_settings,
             save_app_settings,
+            get_agent_models,
+            set_agent_model,
             pick_directory,
             get_resolved_directories,
             open_path,
@@ -1438,6 +1513,7 @@ pub fn run() {
             napi_account::list_api_keys,
             napi_account::select_api_key,
             napi_account::fetch_weekly_usage,
+            napi_account::list_models,
             skills::commands::get_installed_skills,
             skills::commands::get_skill_backups,
             skills::commands::delete_skill_backup,
@@ -1595,7 +1671,7 @@ mod tests {
         if std::env::var("NAPI_SKIP_KEYRING_TESTS").is_ok() {
             return;
         }
-        let entry = keyring::Entry::new("napi-desktop", "user-token").expect(
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, "user-token").expect(
             "no keyring backend compiled — add a keystore feature to the keyring dependency",
         );
         // The keychain itself may still be locked/absent at runtime: tolerate a
@@ -1638,12 +1714,12 @@ mod tests {
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         env["ANTHROPIC_AUTH_TOKEN"] = serde_json::Value::String("sk-new".into());
         env["ANTHROPIC_BASE_URL"] =
-            serde_json::Value::String("https://napi.mikawi.org".into());
+            serde_json::Value::String("https://tal2a.app".into());
         // Round-trip: serialize, re-parse, assert fields changed and the rest intact.
         let out = serde_json::to_string(&v).unwrap();
         let back: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(back["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-new");
-        assert_eq!(back["env"]["ANTHROPIC_BASE_URL"], "https://napi.mikawi.org");
+        assert_eq!(back["env"]["ANTHROPIC_BASE_URL"], "https://tal2a.app");
         assert!(back["env"].get("ANTHROPIC_API_KEY").is_none());
         assert_eq!(back["permissions"]["allow"][0], "Bash");
     }

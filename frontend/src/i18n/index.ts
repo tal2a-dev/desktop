@@ -144,7 +144,7 @@ const EN: Dict = {
     discover: "Discover Skills",
     import: "Import Existing",
     importDescription:
-      "Select skills to import into NAPI Desktop unified management",
+      "Select skills to import into tal2a unified management",
     importSuccess: "Successfully imported {{count}} skills",
     importSelected: "Import Selected ({{count}})",
     noUnmanagedFound:

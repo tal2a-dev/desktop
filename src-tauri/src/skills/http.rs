@@ -8,7 +8,7 @@ pub fn client() -> Client {
     CLIENT
         .get_or_init(|| {
             Client::builder()
-                .user_agent("napi-desktop-skills/0.1")
+                .user_agent("tal2a-skills/0.1")
                 .timeout(Duration::from_secs(60))
                 .build()
                 .unwrap_or_else(|_| Client::new())
